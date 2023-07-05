@@ -1,8 +1,17 @@
 
-A simple work queue library backed by a sql database.  Processing of data requires polling the WorkQueue table.  Do not use with a high load system.
+A simple work queue library backed by a sql database.  Processing of data requires polling the WorkQueue table.  **Do not use with a high load system**.
 
 Providing alternative backends based on tools such as kafka, redis, or rabbitmq is left as an exercise for the reader.
 
+
+# nuget package
+
+
+Build the project in Release mode. It will produce a nuget package in the bin folder. Upload it to your nuget repository or point the nuget source at the folder. Have fun.
+
+```powershell
+dotnet add package "TownSuite.WorkQueue" --source "C:\the\folder\with\the\nuget\package\TownSuite.WorkQueue.nupkg"
+```
 
 
 # Example
