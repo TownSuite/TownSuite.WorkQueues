@@ -5,20 +5,21 @@ GO
 
 CREATE PROCEDURE [dbo].[WorkQueue_Dequeue]
     (
-    @Channel nvarchar(50),
-    @Offset int
+    @p_channel nvarchar(50),
+    @p_offset int,
+    @p_payload nvarchar(MAX) OUTPUT
 )
 AS
 BEGIN
    
-    DELETE TOP(1) FROM dbo.WorkQueue
-    OUTPUT deleted.Payload
-    WHERE Id = (
-    SELECT Id
-    FROM WorkQueue WITH (ROWLOCK, UPDLOCK, READPAST)
-        WHERE Channel = @channel
-    ORDER BY Id
-    OFFSET @offset ROWS
+    DELETE TOP(1) FROM dbo.workqueue
+    OUTPUT deleted.payload as p_payload
+    WHERE id = (
+    SELECT id
+    FROM workqueue WITH (ROWLOCK, UPDLOCK, READPAST)
+        WHERE channel = @p_channel
+    ORDER BY id
+    OFFSET @p_offset ROWS
     FETCH NEXT 1 ROWS ONLY);
 
 END

@@ -59,3 +59,19 @@ public async Task ProcessTheData<T>(T request, DbConnection cn, IWorkQueue _work
 ```
 
 
+# TownSuite.WorkQueues.Testing Instructions
+
+Create a sql server and postgresql database.   Update appsetting.json connection string.
+
+Run the scripts in the following order.  Once the database and scripts are run the nunit tests can be run.
+
+* postgresql/
+    * public.WorkQueue.sql
+    * public.WorkQueue_Enqueue.sql
+    * public.WorkQueue_Dequeue.sql
+* sql-server/
+    * dbo.WorkQueue.sql
+    * dbo.WorkQueue_Enqueue.sql
+    * dbo.WorkQueue_Dequeue.sql
+
+

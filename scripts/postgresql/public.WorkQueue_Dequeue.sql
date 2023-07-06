@@ -1,24 +1,24 @@
-CREATE OR REPLACE FUNCTION public.WorkQueue_Dequeue(
-    p_Channel VARCHAR(50),
-    p_Offset INT
+CREATE OR REPLACE PROCEDURE public.workqueue_dequeue(
+    p_channel VARCHAR(50),
+    p_offset INT,
+    OUT p_payload TEXT
 )
-RETURNS TEXT AS $$
-DECLARE
-    v_Payload TEXT;
+LANGUAGE plpgsql
+AS $$
 BEGIN
-    WITH cte AS (
-        SELECT Id, Payload
-        FROM public.WorkQueue
-        WHERE Channel = p_Channel
-        ORDER BY Id
-        OFFSET p_Offset ROWS
-        FETCH NEXT 1 ROWS ONLY
-        FOR UPDATE SKIP LOCKED
+    DELETE FROM public.workqueue
+    WHERE id IN (
+        WITH cte AS (
+            SELECT id, payload
+            FROM public.workqueue
+            WHERE channel = p_channel
+            ORDER BY id
+            OFFSET p_offset ROWS
+            FETCH NEXT 1 ROWS ONLY
+            FOR UPDATE SKIP LOCKED
+        )
+        SELECT id FROM cte
     )
-    DELETE FROM public.WorkQueue
-    WHERE Id IN (SELECT Id FROM cte)
-    RETURNING cte.Payload INTO v_Payload;
-
-    RETURN v_Payload;
+    RETURNING payload INTO p_payload;
 END;
-$$ LANGUAGE plpgsql;
+$$;

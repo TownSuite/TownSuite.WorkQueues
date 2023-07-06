@@ -1,6 +1,6 @@
-CREATE TABLE public.WorkQueue (
-    Id SERIAL PRIMARY KEY,
-    TimeCreatedUtc TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    Channel VARCHAR(50) NOT NULL,
-    Payload TEXT NOT NULL
+CREATE TABLE public.workqueue (
+    id SERIAL PRIMARY KEY,
+    timecreatedutc TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    channel VARCHAR(50) NOT NULL,
+    payload TEXT NOT NULL
 );

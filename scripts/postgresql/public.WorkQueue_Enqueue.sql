@@ -1,10 +1,11 @@
-CREATE OR REPLACE FUNCTION public.WorkQueue_Enqueue(
-    p_Channel VARCHAR(50),
-    p_Payload TEXT
+CREATE OR REPLACE PROCEDURE public.workqueue_enqueue(
+    p_channel VARCHAR(50),
+    p_payload TEXT
 )
-RETURNS VOID AS $$
+LANGUAGE plpgsql
+AS $$
 BEGIN
-    INSERT INTO public.WorkQueue (Channel, Payload)
-    VALUES (p_Channel, p_Payload);
+    INSERT INTO public.workqueue (channel, payload)
+    VALUES (p_channel, p_payload);
 END;
-$$ LANGUAGE plpgsql;
+$$;

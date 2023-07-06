@@ -5,13 +5,13 @@ GO
 
 CREATE PROCEDURE [dbo].[WorkQueue_Enqueue]
     (
-    @Channel nvarchar(50),
-    @Payload nvarchar(max)
+    @p_channel nvarchar(50),
+    @p_payload nvarchar(max)
 )
 AS
 BEGIN
 
-    INSERT INTO dbo.WorkQueue ([Channel],[Payload]) VALUES(@Channel, @Payload);
+    INSERT INTO dbo.WorkQueue ([Channel],[Payload]) VALUES(@p_channel, @p_payload);
 
 END
 

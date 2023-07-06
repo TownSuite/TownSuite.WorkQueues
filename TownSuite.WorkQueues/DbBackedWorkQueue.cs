@@ -36,17 +36,17 @@ public class DbBackedWorkQueue
 
         await using (var command = con.CreateCommand())
         {
-            command.CommandText = "WorkQueue_Enqueue";
+            command.CommandText = "workqueue_enqueue";
             command.CommandType = CommandType.StoredProcedure;
             command.Transaction = txn;
 
-            IDbDataParameter channelParam = command.CreateParameter();
-            channelParam.ParameterName = "@Channel";
+            var channelParam = command.CreateParameter();
+            channelParam.ParameterName = "@p_channel";
             channelParam.Value = channel;
             command.Parameters.Add(channelParam);
 
-            IDbDataParameter payloadParam = command.CreateParameter();
-            payloadParam.ParameterName = "@Payload";
+            var payloadParam = command.CreateParameter();
+            payloadParam.ParameterName = "@p_payload";
             payloadParam.Value = jsonPayload;
             command.Parameters.Add(payloadParam);
 
@@ -68,20 +68,26 @@ public class DbBackedWorkQueue
 
         using (var command = con.CreateCommand())
         {
-            command.CommandText = "WorkQueue_Dequeue";
+            command.CommandText = "workqueue_dequeue";
             command.CommandType = CommandType.StoredProcedure;
             command.Transaction = txn;
 
             var channelParameter = command.CreateParameter();
-            channelParameter.ParameterName = "@channel";
+            channelParameter.ParameterName = "@p_channel";
             channelParameter.Value = channel;
             command.Parameters.Add(channelParameter);
 
             var offsetParameter = command.CreateParameter();
-            offsetParameter.ParameterName = "@offset";
+            offsetParameter.ParameterName = "@p_offset";
             offsetParameter.Value = offset;
             command.Parameters.Add(offsetParameter);
-
+            
+            var payloadParameter = command.CreateParameter();
+            payloadParameter.ParameterName = "@p_payload";
+            payloadParameter.Value = offset;
+            payloadParameter.Direction = ParameterDirection.Output;
+            command.Parameters.Add(payloadParameter);
+            
             await using (var reader = await command.ExecuteReaderAsync())
             {
                 if (await reader.ReadAsync())
