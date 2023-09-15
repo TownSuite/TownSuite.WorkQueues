@@ -7,6 +7,7 @@ CREATE TABLE [dbo].[workqueue](
 	[timecreatedutc] [datetime] NOT NULL,
 	[channel] [nvarchar](50) NOT NULL,
 	[payload] [nvarchar](max) NOT NULL,
+	[timeprocessedutc] [datetime] NULL
  CONSTRAINT [PK_WorkQueue] PRIMARY KEY CLUSTERED 
 (
 	[Id] ASC

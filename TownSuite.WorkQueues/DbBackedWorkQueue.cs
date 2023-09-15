@@ -57,12 +57,12 @@ public class DbBackedWorkQueue
     }
 
 
-    public async Task<T> Dequeue<T>(string channel, IDbConnection con, IDbTransaction txn, int offset = 0)
+    public virtual async Task<T> Dequeue<T>(string channel, IDbConnection con, IDbTransaction txn, int offset = 0)
     {
         return await Dequeue<T>(channel, con as DbConnection, txn == null ? null : txn as DbTransaction, offset);
     }
 
-    public async Task<T> Dequeue<T>(string channel, DbConnection con, DbTransaction txn, int offset = 0)
+    public virtual async Task<T> Dequeue<T>(string channel, DbConnection con, DbTransaction txn, int offset = 0)
     {
         if (con.State == ConnectionState.Closed) await con.OpenAsync();
 
