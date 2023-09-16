@@ -1,3 +1,4 @@
+using Dapper;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -8,7 +9,7 @@ namespace TownSuite.WorkQueues.Testing;
 public class SqlServerBackedTest
 {
     private IConfiguration config;
-    
+
     [SetUp]
     public void Setup()
     {
@@ -25,12 +26,16 @@ public class SqlServerBackedTest
         await cn.OpenAsync();
 
         var workQueue = new DbBackedWorkQueue();
-        
+
         await workQueue.Enqueue("AUniqueChannelName",
-            new {Hello = "world"}, cn, null);
-        
-        var result = await workQueue.Dequeue<dynamic>("AUniqueChannelName", cn, null);
-            
+            new { Hello = "world" }, cn, null);
+
+        await using var txn = cn.BeginTransaction();
+        var result = await workQueue.Dequeue<dynamic>("AUniqueChannelName", cn, txn);
+        txn.Commit();
         Assert.That(string.Equals(result.ToString(), "{ Hello = world }"));
+
+        var found = cn.QueryFirstOrDefault("select * from workqueue");
+        Assert.That(found == null);
     }
 }

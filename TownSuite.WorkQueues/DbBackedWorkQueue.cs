@@ -64,6 +64,11 @@ public class DbBackedWorkQueue
 
     public virtual async Task<T> Dequeue<T>(string channel, DbConnection con, DbTransaction txn, int offset = 0)
     {
+        if (txn == null)
+        {
+            throw new WorkQueuesException("txn must be set");
+        }
+        
         if (con.State == ConnectionState.Closed) await con.OpenAsync();
 
         using (var command = con.CreateCommand())
