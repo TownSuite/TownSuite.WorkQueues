@@ -5,7 +5,7 @@ using Newtonsoft.Json;
 
 namespace TownSuite.WorkQueues;
 
-public class DbBackedWorkQueue_NonDestructive : DbBackedWorkQueue
+public class DbBackedWorkQueue_NonDestructive : DbBackedWorkQueue, IWorkQueue
 {
     public override async Task<T> Dequeue<T>(string channel, IDbConnection con, IDbTransaction txn, int offset = 0)
     {
