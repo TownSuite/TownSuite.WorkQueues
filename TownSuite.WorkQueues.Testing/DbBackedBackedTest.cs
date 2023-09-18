@@ -1,3 +1,4 @@
+using Dapper;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 
@@ -15,8 +16,16 @@ public class DbBackedBackedTest
             .AddJsonFile("appsettings.json")
             .AddEnvironmentVariables()
             .Build();
+        Cleanup();
     }
 
+    private void Cleanup()
+    {
+        using var cn = new SqlConnection(config.GetConnectionString("SqlServerDbConnection"));
+        cn.Open();
+        cn.Execute("delete from workqueue where channel='ASecondUniqueChannelName';");
+    }
+    
     [Test]
     public async Task DequeueMustHaveTransactionTest1()
     {
@@ -27,7 +36,7 @@ public class DbBackedBackedTest
 
         Assert.ThrowsAsync<WorkQueuesException>(async () =>
         {
-            var result = await workQueue.Dequeue<dynamic>("AUniqueChannelName", cn, null);
+            var result = await workQueue.Dequeue<dynamic>("ASecondUniqueChannelName", cn, null);
         });
     }
 }

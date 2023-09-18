@@ -13,17 +13,14 @@ AS
 BEGIN
 
     UPDATE TOP(1) dbo.workqueue
-    SET timeprocessedutc = GETUTCDATE()
-    WHERE id = 
-    
-    (select top 1
-        id
-    from (
+    SET timeprocessedutc = GETUTCDATE(), @p_payload=payload
+    WHERE id = (
     SELECT id
-        FROM workqueue WITH (ROWLOCK, UPDLOCK, READPAST)
-        WHERE channel = @p_channel and timeprocessedutc is null
-        ORDER BY id
-    OFFSET @p_offset ROWS) tbl);
+    FROM workqueue WITH (ROWLOCK, UPDLOCK, READPAST)
+        WHERE channel = @p_channel
+    ORDER BY id
+    OFFSET @p_offset ROWS
+    FETCH NEXT 1 ROWS ONLY);
 
 END
 

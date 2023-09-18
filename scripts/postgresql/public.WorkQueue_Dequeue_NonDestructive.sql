@@ -1,4 +1,4 @@
-CREATE OR REPLACE PROCEDURE public.workqueue_dequeue(
+CREATE OR REPLACE PROCEDURE public.workqueue_dequeue_nondestructive(
     p_channel VARCHAR(50),
     p_offset INT,
     OUT p_payload TEXT

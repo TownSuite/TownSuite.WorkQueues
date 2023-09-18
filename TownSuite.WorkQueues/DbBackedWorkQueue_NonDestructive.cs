@@ -31,31 +31,29 @@ public class DbBackedWorkQueue_NonDestructive : DbBackedWorkQueue
             offsetParameter.ParameterName = "@p_offset";
             offsetParameter.Value = offset;
             command.Parameters.Add(offsetParameter);
-            
+
             var payloadParameter = command.CreateParameter();
             payloadParameter.ParameterName = "@p_payload";
-            payloadParameter.Value = offset;
+            payloadParameter.DbType = DbType.String;
+            payloadParameter.Size = int.MaxValue;
             payloadParameter.Direction = ParameterDirection.Output;
             command.Parameters.Add(payloadParameter);
             
             await using (var reader = await command.ExecuteReaderAsync())
             {
-                if (await reader.ReadAsync())
+                string jsonPayload = payloadParameter.Value?.ToString();
+
+                if (string.IsNullOrWhiteSpace(jsonPayload))
                 {
-                    string jsonPayload = reader.GetString(0);
-
-                    if (string.IsNullOrWhiteSpace(jsonPayload))
-                    {
-                        return default(T);
-                    }
-
-                    var settings = new JsonSerializerSettings
-                    {
-                        TypeNameHandling = TypeNameHandling.Auto
-                    };
-
-                    return JsonConvert.DeserializeObject<T>(jsonPayload, settings);
+                    return default(T);
                 }
+
+                var settings = new JsonSerializerSettings
+                {
+                    TypeNameHandling = TypeNameHandling.Auto
+                };
+
+                return JsonConvert.DeserializeObject<T>(jsonPayload, settings);
             }
         }
 

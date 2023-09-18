@@ -89,7 +89,8 @@ public class DbBackedWorkQueue
             
             var payloadParameter = command.CreateParameter();
             payloadParameter.ParameterName = "@p_payload";
-            payloadParameter.Value = offset;
+            payloadParameter.DbType = DbType.String;
+            payloadParameter.Size = int.MaxValue;
             payloadParameter.Direction = ParameterDirection.Output;
             command.Parameters.Add(payloadParameter);
             
