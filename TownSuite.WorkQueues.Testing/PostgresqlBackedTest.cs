@@ -1,3 +1,4 @@
+using Dapper;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Npgsql;
@@ -25,11 +26,14 @@ public class PostgresqlBackedTest
 
         var workQueue = new DbBackedWorkQueue();
         
-        await workQueue.Enqueue("AUniqueChannelName",
-            new {Hello = "world"}, cn, null);
+        await workQueue.Enqueue<TestValue>("AUniqueChannelName",
+            new TestValue {Hello = "world"}, cn, null);
         
-        var result = await workQueue.Dequeue<dynamic>("AUniqueChannelName", cn, null);
-            
-        Assert.That(string.Equals(result.ToString(), "{ Hello = world }"));
+        await using var txn = cn.BeginTransaction();
+        var result = await workQueue.Dequeue<TestValue>("AUniqueChannelName", cn, txn);
+        txn.Commit();    
+        Assert.That(string.Equals(result.Hello, "world"));
+        var found = cn.QueryFirstOrDefault("select * from workqueue");
+        Assert.That(found == null, "is null");
     }
 }
