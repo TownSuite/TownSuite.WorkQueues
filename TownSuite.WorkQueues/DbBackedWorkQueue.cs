@@ -13,53 +13,82 @@ public class DbBackedWorkQueue
     // ROWLOCK places locks on row level opposed to a page or table lock.
     // READPAST Records that are locked are not returned 
 
-    public async Task<bool> Enqueue<T>(string channel, T payload, IDbConnection con, IDbTransaction txn = null)
+    public async Task<bool> Enqueue<T>(string channel, T payload, IDbConnection con, IDbTransaction? txn = null)
     {
-        return await Enqueue<T>(channel, payload, con as DbConnection, txn == null ? null : txn as DbTransaction);
+#if NET8_0_OR_GREATER
+        ArgumentNullException.ThrowIfNullOrEmpty(channel, nameof(channel));
+#endif
+        ArgumentNullException.ThrowIfNull(con, nameof(con));
+        ArgumentNullException.ThrowIfNull(payload, nameof(payload));
+        
+        if (con is not DbConnection connection)
+        {
+            throw new WorkQueuesException("con must be a DbConnection");
+        }
+        
+        if (txn != null && txn is not DbTransaction)
+        {
+            throw new WorkQueuesException("txn must be a DbTransaction");
+        }
+        
+        return await Enqueue<T>(channel, payload, connection, txn as DbTransaction);
     }
 
-    public async Task<bool> Enqueue<T>(string channel, T payload, DbConnection con, DbTransaction txn = null)
+    public async Task<bool> Enqueue<T>(string channel, T payload, DbConnection con, DbTransaction? txn = null)
     {
-        object responseDefaultDataEvenWhenNull = default(T);
+#if NET8_0_OR_GREATER
+        ArgumentNullException.ThrowIfNullOrEmpty(channel, nameof(channel));
+#endif
+        ArgumentNullException.ThrowIfNull(con, nameof(con));
+        ArgumentNullException.ThrowIfNull(payload, nameof(payload));
+        
         string jsonPayload = JsonConvert.SerializeObject(payload, Formatting.Indented, new JsonSerializerSettings
         {
             TypeNameHandling = TypeNameHandling.All
         });
-        string serializedPlaceholderResponse = JsonConvert.SerializeObject(responseDefaultDataEvenWhenNull,
-            Formatting.Indented, new JsonSerializerSettings
-            {
-                TypeNameHandling = TypeNameHandling.All
-            });
 
         if (con.State == ConnectionState.Closed)
             await con.OpenAsync();
 
-        await using (var command = con.CreateCommand())
-        {
-            command.CommandText = "workqueue_enqueue";
-            command.CommandType = CommandType.StoredProcedure;
-            command.Transaction = txn;
+        await using var command = con.CreateCommand();
+        command.CommandText = "workqueue_enqueue";
+        command.CommandType = CommandType.StoredProcedure;
+        command.Transaction = txn;
 
-            var channelParam = command.CreateParameter();
-            channelParam.ParameterName = "@p_channel";
-            channelParam.Value = channel;
-            command.Parameters.Add(channelParam);
+        var channelParam = command.CreateParameter();
+        channelParam.ParameterName = "@p_channel";
+        channelParam.Value = channel;
+        command.Parameters.Add(channelParam);
 
-            var payloadParam = command.CreateParameter();
-            payloadParam.ParameterName = "@p_payload";
-            payloadParam.Value = jsonPayload;
-            command.Parameters.Add(payloadParam);
+        var payloadParam = command.CreateParameter();
+        payloadParam.ParameterName = "@p_payload";
+        payloadParam.Value = jsonPayload;
+        command.Parameters.Add(payloadParam);
 
-            int rowsAffected = await command.ExecuteNonQueryAsync();
+        int rowsAffected = await command.ExecuteNonQueryAsync();
 
-            return rowsAffected > 0;
-        }
+        return rowsAffected > 0;
     }
 
 
     public virtual async Task<T> Dequeue<T>(string channel, IDbConnection con, IDbTransaction txn, int offset = 0)
     {
-        return await Dequeue<T>(channel, con as DbConnection, txn == null ? null : txn as DbTransaction, offset);
+        if (con is null)
+        {
+            throw new WorkQueuesException("con must be set");
+        }
+        
+        if (con is not DbConnection connection)
+        {
+            throw new WorkQueuesException("con must be a DbConnection");
+        }
+        
+        if (txn is not DbTransaction transaction)
+        {
+            throw new WorkQueuesException("txn must be a DbTransaction");
+        }
+        
+        return await Dequeue<T>(channel, connection, transaction, offset);
     }
 
     public virtual async Task<T> Dequeue<T>(string channel, DbConnection con, DbTransaction txn, int offset = 0)
@@ -71,7 +100,7 @@ public class DbBackedWorkQueue
         
         if (con.State == ConnectionState.Closed) await con.OpenAsync();
 
-        using (var command = con.CreateCommand())
+        await using (var command = con.CreateCommand())
         {
             command.CommandText = "workqueue_dequeue";
             command.CommandType = CommandType.StoredProcedure;
@@ -102,7 +131,7 @@ public class DbBackedWorkQueue
 
                     if (string.IsNullOrWhiteSpace(jsonPayload))
                     {
-                        return default(T);
+                        return default!;
                     }
 
                     var settings = new JsonSerializerSettings
@@ -110,11 +139,11 @@ public class DbBackedWorkQueue
                         TypeNameHandling = TypeNameHandling.Auto
                     };
 
-                    return JsonConvert.DeserializeObject<T>(jsonPayload, settings);
+                    return JsonConvert.DeserializeObject<T>(jsonPayload, settings)!;
                 }
             }
         }
 
-        return default(T);
+        return default!;
     }
 }

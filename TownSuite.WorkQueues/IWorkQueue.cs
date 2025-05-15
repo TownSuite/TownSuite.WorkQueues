@@ -5,8 +5,8 @@ namespace TownSuite.WorkQueues;
 
 public interface IWorkQueue
 {
-    Task<bool> Enqueue<T>(string channel, T payload, IDbConnection con, IDbTransaction txn = null);
-    Task<bool> Enqueue<T>(string channel, T payload, DbConnection con, DbTransaction txn = null);
+    Task<bool> Enqueue<T>(string channel, T payload, IDbConnection con, IDbTransaction? txn = null);
+    Task<bool> Enqueue<T>(string channel, T payload, DbConnection con, DbTransaction? txn = null);
 
     /// <summary>
     /// 
