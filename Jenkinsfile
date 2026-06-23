@@ -92,7 +92,7 @@ pipeline {
                     steps {
                         echo 'archiving artifacts'
                         script {
-                            townsuite.archiveWithRetryAndLock('build/*.SHA256SUMS,build/*.sig,build/*.nupkg', 3)
+                            townsuite.archiveWithRetryAndLock('build/*.SHA256SUMS,build/*.sig,build/*.nupkg,build/parameterproperties.txt', 3)
                         }
                     }
                 }
