@@ -2,19 +2,15 @@
 
     <PropertyGroup>
         <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
         <PackageId>TownSuite.WorkQueues.Redis</PackageId>
-        <Version>2.5.0</Version>
         <Description>Redis Streams backend for TownSuite.WorkQueues. Provides RedisMessageBus with consumer groups, at-least-once delivery, automatic retry, dead-lettering, and XAUTOCLAIM-based reclaim. No SQL schema required.</Description>
         <PackageTags>workqueue;messagebus;redis;redis-streams;background-jobs;queue</PackageTags>
-        <PackageLicenseExpression>MIT</PackageLicenseExpression>
         <PackageReleaseNotes>v2.5.0 — version aligned with TownSuite.WorkQueues 2.5.0. See CHANGELOG.md in the core package for full notes.</PackageReleaseNotes>
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.10" />
-        <PackageReference Include="StackExchange.Redis" Version="2.8.0" />
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+        <PackageReference Include="StackExchange.Redis" />
     </ItemGroup>
 
     <ItemGroup>

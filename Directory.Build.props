@@ -1,0 +1,14 @@
+<Project>
+
+    <PropertyGroup>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+
+    <!-- Shared NuGet package metadata for the packable backend libraries. -->
+    <PropertyGroup>
+        <Version>26.0.0</Version>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    </PropertyGroup>
+
+</Project>

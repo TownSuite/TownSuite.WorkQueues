@@ -1,14 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
-		<TargetFrameworks>;net8.0;net10.0</TargetFrameworks>
-		<ImplicitUsings>enable</ImplicitUsings>
-		<Nullable>enable</Nullable>
+		<TargetFrameworks>net8.0;net10.0</TargetFrameworks>
 		<PackageId>TownSuite.WorkQueues.Postgres</PackageId>
-		<Version>2.5.0</Version>
 		<Description>PostgreSQL backend for TownSuite.WorkQueues. Provides PostgresMessageBus with FOR UPDATE SKIP LOCKED concurrency, automatic schema migration, and full IMessageBus support including scheduled delivery and dead-lettering.</Description>
 		<PackageTags>workqueue;messagebus;postgres;postgresql;background-jobs;queue</PackageTags>
-		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<PackageReleaseNotes>v2.5.0 — version aligned with TownSuite.WorkQueues 2.5.0. See CHANGELOG.md in the core package for full notes.</PackageReleaseNotes>
 	</PropertyGroup>
 
@@ -16,8 +12,8 @@
 		<ProjectReference Include="..\TownSuite.WorkQueues\TownSuite.WorkQueues.csproj" />
 	</ItemGroup>
 	<ItemGroup>
-		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.10" />
-		<PackageReference Include="Npgsql" Version="8.0.9" />
+		<PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+		<PackageReference Include="Npgsql" />
 	</ItemGroup>
 	<ItemGroup>
 	  <EmbeddedResource Include="..\scripts\postgresql\public.WorkQueue.sql">

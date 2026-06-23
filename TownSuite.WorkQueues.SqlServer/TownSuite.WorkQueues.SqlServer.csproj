@@ -2,19 +2,15 @@
 
     <PropertyGroup>
         <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
         <PackageId>TownSuite.WorkQueues.SqlServer</PackageId>
-        <Version>2.5.0</Version>
         <Description>SQL Server backend for TownSuite.WorkQueues. Provides SqlServerMessageBus with UPDLOCK+ROWLOCK+READPAST concurrency, automatic schema migration, and full IMessageBus support including scheduled delivery and dead-lettering.</Description>
         <PackageTags>workqueue;messagebus;sqlserver;sql-server;background-jobs;queue</PackageTags>
-        <PackageLicenseExpression>MIT</PackageLicenseExpression>
         <PackageReleaseNotes>v2.5.0 — version aligned with TownSuite.WorkQueues 2.5.0. See CHANGELOG.md in the core package for full notes.</PackageReleaseNotes>
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="Microsoft.Data.SqlClient" Version="6.1.4" />
-        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.10" />
+        <PackageReference Include="Microsoft.Data.SqlClient" />
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
     </ItemGroup>
 
     <ItemGroup>

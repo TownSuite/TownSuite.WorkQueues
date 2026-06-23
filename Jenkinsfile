@@ -40,12 +40,12 @@ pipeline {
                         dotnet test TownSuite.WorkQueues.Testing/TownSuite.WorkQueues.Testing.csproj \
                             --configuration Release \
                             --no-build \
-                            --logger "nunit;LogFilePath=TestResults/results.xml"
+                            --logger "nunit"
                         '''
                     }
                     post {
                         always {
-                            nunit testResultsPattern: 'TestResults/results.xml'
+                            nunit testResultsPattern: '**/TestResults/*.xml'
                         }
                     }
                 }

@@ -2,14 +2,10 @@
 
     <PropertyGroup>
         <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
 
         <PackageId>TownSuite.WorkQueues</PackageId>
-        <Version>2.5.0</Version>
         <Description>A work queue and message bus for .NET backed by PostgreSQL, SQL Server, Redis, or SQLite. Direct enqueue/dequeue API and a publish/subscribe message bus with at-least-once delivery, automatic retry, dead-lettering, scheduled delivery, and scoped consumers.</Description>
         <PackageTags>workqueue;messagebus;postgres;postgresql;sqlserver;redis;sqlite;background-jobs;queue;pubsub</PackageTags>
-        <PackageLicenseExpression>MIT</PackageLicenseExpression>
         <PackageReadmeFile>README.md</PackageReadmeFile>
         <PackageReleaseNotes>v2.5.0 — SQLite backend for local development (multi-process, WAL mode, visibility-timeout claiming). See included CHANGELOG.md for full notes.</PackageReleaseNotes>
         <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
