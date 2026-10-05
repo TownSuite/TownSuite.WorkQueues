@@ -102,7 +102,18 @@ cycle (within `MaxWaitTime`, default 5 s).
 - [Redis Backend](#redis-backend)
 - [Dead-Letter Queue & Retries](#dead-letter-queue--retries)
   - [Programmatic replay via ReplayDeadLettered\<T\>](#programmatic-replay-via-replaydeadletteredt)
+  - [Listing dead-lettered messages](#listing-dead-lettered-messages)
+  - [Fault delivery guarantees](#fault-delivery-guarantees)
+  - [Retry backoff](#retry-backoff)
+  - [Non-retryable exceptions](#non-retryable-exceptions)
   - [Checking bus health with IsPolling](#checking-bus-health-with-ispolling)
+- [Message Expiry](#message-expiry)
+- [Transactional Publish (outbox)](#transactional-publish-outbox)
+- [Concurrency](#concurrency)
+  - [Lease-based claiming](#lease-based-claiming)
+- [Purging Old Messages](#purging-old-messages)
+- [Monitoring: Metrics & Queue Statistics](#monitoring-metrics--queue-statistics)
+  - [Health checks](#health-checks)
 - [Configuration Reference](#configuration-reference)
 - [Running the Tests](#running-the-tests)
 - [Upgrading from Earlier Versions](#upgrading-from-earlier-versions)
@@ -155,6 +166,12 @@ Run the scripts in `scripts/sql-server/` in this order against your database:
 ---
 
 ## Work Queue (direct enqueue/dequeue)
+
+> **Legacy API.** `IWorkQueue`, `DbBackedWorkQueue`, `DbBackedWorkQueue_NonDestructive` and the Redis
+> `IRedisWorkQueue` are marked `[Obsolete]` with diagnostic id `TSWQ001`. New code should use the
+> [message bus](#message-bus-publishsubscribe); to enqueue inside your own transaction use
+> [transactional publish](#transactional-publish-outbox). See [MIGRATING.md](MIGRATING.md). Existing
+> callers keep working; suppress the warning with `<NoWarn>$(NoWarn);TSWQ001</NoWarn>` while migrating.
 
 Both PostgreSQL and SQL Server are supported. Inject `IWorkQueue` and use any open `DbConnection`.
 
@@ -482,9 +499,26 @@ await bus.Publish(new OrderSubmitted { OrderId = Guid.NewGuid() });
 
 1. A message is claimed with `XREADGROUP`. On failure, it stays in the Pending Entry List.
 2. Once idle for `ReclaimIdleTime` (default `MaxWaitTime × 3`), `XAUTOCLAIM` reclaims it and increments its retry counter.
-3. When `retryCount >= MaxRetries`, the message is copied to `{prefix}:stream:{type}:dead` and ACK-ed on the main stream.
+   With a `RetryDelay` set, the failed message is instead moved to `{prefix}:stream:{type}:scheduled` and
+   returns to the stream after the delay (with `RetryBackoffMultiplier` and `MaxRetryDelay`).
+3. When the attempts reach `MaxRetries`, the message is copied to `{prefix}:stream:{type}:dead` and ACK-ed on the main stream.
 
-Dead-lettered messages can be inspected and replayed using `XREAD` or any Redis client.
+Dead-lettered messages can be listed with `GetDeadLettered<T>`, replayed with `ReplayDeadLettered<T>`, or
+inspected with any Redis client.
+
+#### Scheduled delivery and transactional publish
+
+`Publish(message, deliverAfter)` and `PublishOptions.DeliverAfter` hold the message in the
+`{prefix}:stream:{type}:scheduled` sorted set until it is due. To publish inside your own Redis
+`MULTI`/`EXEC`, pass the transaction; the message is added only if it executes:
+
+```cs
+var tran = mux.GetDatabase().CreateTransaction();
+tran.AddCondition(Condition.KeyNotExists($"order:{orderId}:submitted"));
+_ = tran.StringSetAsync($"order:{orderId}:submitted", "1");
+Guid messageId = redisBus.Publish(new OrderSubmitted { OrderId = orderId }, tran);
+await tran.ExecuteAsync();
+```
 
 ### DI registration
 
@@ -552,6 +586,78 @@ int replayed = await bus.ReplayDeadLettered<OrderSubmitted>();
 
 For Redis, this reads entries from the `{prefix}:stream:{type}:dead` key and re-enqueues them to the main stream.
 
+To replay one message, pass its id. `Fault<T>.MessageId` and `ConsumeContext<T>.MessageId` carry it, so an
+admin endpoint or a support tool can replay exactly the message that failed:
+
+```csharp
+bool replayed = await bus.ReplayDeadLettered<PaymentConfirmed>(fault.MessageId);
+```
+
+It returns `false` when no dead-lettered message with that id exists on the channel.
+
+### Listing dead-lettered messages
+
+`GetDeadLettered<T>` lists dead-letters newest first, with the last error and whether the fault has
+been delivered. Use it for an admin screen that shows what failed before someone replays it:
+
+```csharp
+IReadOnlyList<DeadLetteredMessage<PaymentConfirmed>> page =
+    await bus.GetDeadLettered<PaymentConfirmed>(skip: 0, take: 50);
+
+foreach (var dead in page)
+    Console.WriteLine($"{dead.MessageId} {dead.FailedAt:u} {dead.ExceptionType}: {dead.ExceptionMessage}");
+```
+
+`Message` is `null` (default) if the stored payload no longer deserialises to `T`; `Payload` always
+holds the raw JSON. Error details are recorded from this version on; older dead-letters list without them.
+
+### Fault delivery guarantees
+
+`Fault<T>` delivery is **at-least-once**, like message delivery:
+
+1. The dead-letter is committed first, together with the error and a fault redelivery time.
+2. The bus then delivers the fault to its `Fault<T>` consumers and records it as delivered.
+3. If a fault consumer throws, or the process stops before step 2 finishes, the fault stays pending.
+   After `FaultRedeliveryDelay` (default one minute) any bus on the same store with a fault consumer for
+   `T` delivers it again, with `Fault<T>.IsRedelivery = true`.
+
+So fault consumers must be idempotent. A bus that only calls `SubscribeFault<T>` (no `Subscribe<T>`)
+still delivers faults for `T`.
+
+Faults for messages dead-lettered while **no** bus had a fault consumer for `T` stay pending, and are
+delivered once one subscribes. `QueueStatistics.PendingFaultCount` shows how many are waiting; a value
+that stays above zero means a fault consumer keeps failing or none is subscribed.
+
+### Retry backoff
+
+`RetryDelay` holds a failed message back before its next attempt. Set `RetryBackoffMultiplier` to grow
+the delay on each attempt, and `MaxRetryDelay` to cap it (without a cap, delays stop growing at one day):
+
+```csharp
+var options = new SqlServerTransportOptions
+{
+    MaxRetries             = 10,
+    RetryDelay             = TimeSpan.FromSeconds(1),   // 1s, 2s, 4s, 8s … 5 min
+    RetryBackoffMultiplier = 2.0,
+    MaxRetryDelay          = TimeSpan.FromMinutes(5)
+};
+```
+
+Backoff applies to every transport. On Redis, a message with no `RetryDelay` is retried after
+`RedisOptions.ReclaimIdleTime` instead.
+
+### Non-retryable exceptions
+
+By default every consumer exception is retried. When some failures can never succeed (bad input, a
+business rule), set `IsRetryable` to dead-letter them on the first failure instead of retrying:
+
+```csharp
+options.IsRetryable = ex => ex is not ValidationException;
+```
+
+The `Fault<T>` consumer still runs, with `Fault<T>.NonRetryable = true`. Prefer handling expected business
+outcomes inside the consumer (record the result and return normally) and throw only for faults.
+
 ### Checking bus health with `IsPolling`
 
 `IMessageBus.IsPolling` is `true` while the background polling loop is alive. Wire it into ASP.NET Core health checks to detect a silently-stopped bus:
@@ -568,6 +674,185 @@ builder.Services.AddHealthChecks()
     });
 ```
 
+`IsPolling` only says the loop is alive. To catch a channel nobody is consuming, alert on queue age
+(see [Monitoring](#monitoring-metrics--queue-statistics)): a bus only claims messages for types it has
+subscribed to, so messages published to a channel with no subscribed bus stay pending indefinitely.
+
+### When fault consumers run
+
+`Fault<T>` consumers run after the dead-letter state is committed, so a fault consumer that reads the
+row (or replays it) sees `failedat` set. See [Fault delivery guarantees](#fault-delivery-guarantees).
+
+---
+
+## Message Expiry
+
+Give a message an expiry when it is pointless to process it late — a cart hold the resident has long
+since abandoned, for example. A message still undelivered when it expires is dead-lettered without
+calling consumers, and its `Fault<T>` has `Expired = true` (exception type `MessageExpiredException`):
+
+```csharp
+await bus.Publish(new CartAddItemRequested { JobId = jobId },
+    new PublishOptions { TimeToLive = TimeSpan.FromMinutes(10) });   // or ExpiresAt = …
+```
+
+`PublishOptions.DeliverAfter` schedules a message the same way. Both options work with the
+transactional overload. Expiry is checked when a message is claimed; a message whose consumer is
+already running is not interrupted. `ReplayDeadLettered` clears the expiry.
+
+---
+
+## Transactional Publish (outbox)
+
+`Publish` normally opens its own connection. To publish only if your own database work commits, pass
+your connection and transaction. The message and your rows commit or roll back together:
+
+```csharp
+await using var cn = new SqlConnection(connectionString);
+await cn.OpenAsync();
+await using var tx = cn.BeginTransaction();
+
+await cn.ExecuteAsync("INSERT INTO PortalJob (JobId, Status) VALUES (@jobId, 'Queued')", new { jobId }, tx);
+Guid messageId = await bus.Publish(new CartAddItemRequested { JobId = jobId }, cn, tx);
+
+tx.Commit();
+```
+
+The connection must be to the database the bus polls (`SqlConnection`, `NpgsqlConnection` or
+`SqliteConnection` to match the transport). Optional `PublishOptions` set a delivery time or expiry. It
+returns the message id that consumers see as `ConsumeContext<T>.MessageId`. On Redis, pass an
+`ITransaction` instead (see [Redis](#scheduled-delivery-and-transactional-publish)).
+
+Use this in place of the legacy `IWorkQueue.Enqueue(channel, payload, cn, txn)`. It needs no stored
+procedure and returns the message id.
+
+---
+
+## Concurrency
+
+Each bus processes its claimed batch one message at a time. Set `MaxConcurrency` to run several polling
+loops in one bus. Each loop claims its own batch, so at most `MaxConcurrency × MaxBatchSize` messages are
+in flight:
+
+```csharp
+var options = new SqlServerTransportOptions
+{
+    MaxConcurrency = 4,   // up to 4 messages at once
+    MaxBatchSize   = 1
+};
+```
+
+Ordering is only guaranteed with `MaxConcurrency = 1`. Concurrency is per bus instance; several
+processes or bus instances on the same database also share the work safely.
+
+By default, on PostgreSQL and SQL Server the claimed batch is held in one open transaction (with row
+locks) until every message in it is handled, and outcomes are committed together. With slow consumers
+either keep `MaxBatchSize = 1`, or use lease-based claiming.
+
+Your consumer's own database work runs on its own connection, separate from the claim. If the process
+dies between your commit and the claim's, the message is redelivered, so consumers must be idempotent
+(check `MessageId` or your own state first).
+
+### Lease-based claiming
+
+Set `ClaimLease` to hold claimed messages with a lease (`lockeduntil` / `locktoken` columns) instead of
+an open transaction. No transaction or row lock stays open while consumers run, so a consumer that calls
+a payment gateway does not hold up anything else, and batches can be larger:
+
+```csharp
+var options = new SqlServerTransportOptions
+{
+    ClaimLease     = TimeSpan.FromMinutes(2),  // longer than the slowest consumer
+    MaxBatchSize   = 10,
+    MaxConcurrency = 4
+};
+```
+
+The trade-off is recovery time: if a process dies, its claimed messages become available again when
+the lease expires, not immediately. A consumer that outlives its lease sees the message delivered a
+second time, and its own late outcome is ignored (a warning is logged). SQLite always claims this way,
+using `ClaimLease` when set and `LockTimeout` otherwise. Lease and transaction claimers can share a table.
+
+---
+
+## Purging Old Messages
+
+Processed and dead-lettered messages stay in the store until deleted. Run a purge on a schedule:
+
+```csharp
+long processed = await bus.PurgeProcessed(DateTimeOffset.UtcNow.AddDays(-30));
+long dead      = await bus.PurgeDeadLettered<PaymentConfirmed>(DateTimeOffset.UtcNow.AddDays(-90));
+```
+
+`PurgeProcessed` covers every channel; `PurgeDeadLettered<T>` one message type, including faults not yet
+delivered for those messages. Both delete in batches so they can run against a busy queue. On Redis,
+`PurgeProcessed` trims each stream no further than the oldest entry any consumer group still needs.
+
+---
+
+## Monitoring: Metrics & Queue Statistics
+
+### Metrics
+
+Every transport emits `System.Diagnostics.Metrics` instruments on the meter `TownSuite.WorkQueues`
+(`WorkQueueMetrics.MeterName`), tagged with `messaging.system` and `messaging.destination.name` (the channel):
+
+| Instrument | Type | Meaning |
+|---|---|---|
+| `townsuite.workqueues.messages.published` | counter | Messages published |
+| `townsuite.workqueues.messages.processed` | counter | Successful deliveries |
+| `townsuite.workqueues.messages.retried` | counter | Failed deliveries that will be retried |
+| `townsuite.workqueues.messages.deadlettered` | counter | Messages dead-lettered |
+| `townsuite.workqueues.messages.expired` | counter | Messages dead-lettered because they expired |
+| `townsuite.workqueues.message.duration` | histogram (s) | Consumer time per attempt |
+| `townsuite.workqueues.queue.pending` | gauge | Pending messages, for tracked queues |
+| `townsuite.workqueues.queue.deadlettered` | gauge | Dead-lettered messages, for tracked queues |
+| `townsuite.workqueues.queue.pending_faults` | gauge | Undelivered faults, for tracked queues |
+| `townsuite.workqueues.queue.oldest_ready_age` | gauge (s) | Age of the oldest deliverable message, for tracked queues |
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(m => m.AddMeter(WorkQueueMetrics.MeterName).AddPrometheusExporter());
+```
+
+### Queue statistics
+
+Backlog size and age need a query, so they are read on demand:
+
+```csharp
+QueueStatistics stats = await bus.GetQueueStatistics<CartAddItemRequested>();
+// stats.PendingCount       — not yet processed (includes scheduled and waiting-for-retry)
+// stats.DeadLetteredCount  — dead-lettered and held for replay
+// stats.PendingFaultCount  — dead-letters whose Fault<T> has not been delivered yet
+// stats.OldestReadyAge     — how long the oldest deliverable message has waited (null if none)
+```
+
+Alert when `OldestReadyAge` grows past what the channel should tolerate: it catches slow consumers,
+stopped workers and channels with no subscriber. Messages scheduled for the future are not counted
+towards the age until they become due.
+
+To publish these as the `queue.*` gauges, track the queue. Statistics are read in the background, so
+metric collection never queries the store:
+
+```csharp
+await using var tracking = WorkQueueMetrics.TrackQueue<CartAddItemRequested>(bus, TimeSpan.FromSeconds(30));
+```
+
+### Health checks
+
+`TownSuite.WorkQueues.HealthChecks` adds a health check that is `Unhealthy` when the bus's polling has
+stopped and `Degraded` (configurable) when a queue threshold is exceeded. Statistics are included in the
+result data:
+
+```csharp
+builder.Services.AddHealthChecks().AddMessageBus(configure: o => o
+    .Queue<CartAddItemRequested>(q => { q.MaxOldestReadyAge = TimeSpan.FromSeconds(30); q.MaxPendingFaults = 0; })
+    .Queue<PaymentConfirmed>(q => q.MaxDeadLettered = 0));
+```
+
+Pass `busFactory` to check a bus that is not the DI-registered `IMessageBus` (for example one per tenant),
+and register one check per bus with distinct names.
+
 ---
 
 ## Configuration Reference
@@ -580,6 +865,13 @@ builder.Services.AddHealthChecks()
 | `MaxWaitTime` | `5s` | How long to pause when the queue is empty before polling again |
 | `ContinuousPolling` | `false` | When `true`, skips the `MaxWaitTime` delay between empty polls. Use only in tests or latency-critical scenarios — otherwise leaves CPU and database idle time on the table. |
 | `MaxRetries` | `3` | Delivery attempts before a message is dead-lettered |
+| `RetryDelay` | `0` | Delay before a failed message is retried (SQL transports) |
+| `RetryBackoffMultiplier` | `1.0` | Multiplier applied to `RetryDelay` for each further attempt |
+| `MaxRetryDelay` | `null` (1 day) | Cap on the computed retry delay |
+| `MaxConcurrency` | `1` | Polling loops run in parallel by one bus |
+| `IsRetryable` | `null` (retry all) | Return `false` to dead-letter an exception immediately |
+| `ClaimLease` | `null` (transaction) | PostgreSQL / SQL Server: hold claims with a lease of this length instead of an open transaction |
+| `FaultRedeliveryDelay` | `1 min` | Delay before an undelivered `Fault<T>` is delivered again; also the lease a bus holds while redelivering |
 
 ### `SqlTransportOptions` (extends `BatchOptions`)
 
@@ -597,8 +889,11 @@ Tests use [Testcontainers](https://dotnet.testcontainers.org/) and spin up real 
 
 ```bash
 cd TownSuite.WorkQueues.Testing
-dotnet test
+dotnet test                      # both target frameworks (net8.0 and net10.0)
+dotnet test -f net10.0           # one framework
 ```
+
+Running the `net8.0` tests needs the .NET 8 runtime installed alongside the SDK.
 
 No external database setup or `appsettings.json` changes are needed.
 
@@ -647,6 +942,26 @@ The migration statements are idempotent (`IF NOT EXISTS`, `ADD COLUMN IF NOT EXI
 ## Benchmarks
 
 These numbers are from a single client machine talking to a dedicated database host. The library is designed for **sustained throughput below 10,000 calls/second**.
+
+### Message bus consumption
+
+`MessageBusThroughputBenchmarks` (run with `dotnet test --filter "Category=Benchmark"`) consumes 400
+messages with a consumer that spends 20 ms per message (standing in for real I/O), against
+Testcontainers databases on one Apple Silicon laptop (Docker Desktop), 26.1.0, .NET 10:
+
+| Configuration | PostgreSQL | SQL Server |
+|---|---|---|
+| `MaxConcurrency = 1`, `MaxBatchSize = 1` | 35 msg/s | 32 msg/s |
+| `MaxConcurrency = 4`, `MaxBatchSize = 1` | 135 msg/s | 140 msg/s |
+| `MaxConcurrency = 8`, `MaxBatchSize = 1` | 305 msg/s | 264 msg/s |
+| `MaxConcurrency = 1`, `MaxBatchSize = 10` | 40 msg/s | 35 msg/s |
+| `MaxConcurrency = 4`, `MaxBatchSize = 10`, `ClaimLease` | 151 msg/s | 132 msg/s |
+| `MaxConcurrency = 8`, `MaxBatchSize = 10`, `ClaimLease` | 307 msg/s | 302 msg/s |
+| 200 undelivered faults redelivered by a second bus | 2.2 s | 2.2 s |
+
+With a consumer doing real work, throughput is bounded by the consumer, so it scales with
+`MaxConcurrency`; a larger batch alone does not help, because a loop handles its batch one message at a
+time. Lease claiming costs nothing measurable over transaction claiming and holds no locks.
 
 ### PostgreSQL
 

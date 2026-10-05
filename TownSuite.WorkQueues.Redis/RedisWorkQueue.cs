@@ -6,6 +6,7 @@ namespace TownSuite.WorkQueues.Redis;
 /// <summary>
 /// Redis-backed work queue using Redis Lists (LPUSH / RPOP) for FIFO delivery.
 /// </summary>
+[Obsolete("Legacy Redis list queue without retry or dead-lettering. Use RedisMessageBus (IMessageBus). See MIGRATING.md.", DiagnosticId = "TSWQ001")]
 public class RedisWorkQueue : IRedisWorkQueue
 {
     private readonly IConnectionMultiplexer _redis;

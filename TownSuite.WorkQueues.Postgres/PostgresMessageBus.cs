@@ -1,334 +1,440 @@
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Npgsql;
-using System.Collections.Concurrent;
+using NpgsqlTypes;
+using System.Data;
+using System.Data.Common;
 using System.Text.Json;
 
 namespace TownSuite.WorkQueues.Postgres;
 
-public class PostgresMessageBus : IMessageBus
+/// <summary>
+/// PostgreSQL-backed message bus with at-least-once delivery, automatic retry, and
+/// dead-lettering. Uses <c>FOR UPDATE SKIP LOCKED</c> so concurrent consumers claim
+/// disjoint sets of messages without blocking each other.
+/// </summary>
+/// <remarks>
+/// <para>By default a claimed batch is held in an open transaction until every message in it is
+/// handled. Set <see cref="BatchOptions.ClaimLease"/> to hold claims with a lease instead.</para>
+/// <para>All timestamps are UTC, taken from <c>now() AT TIME ZONE 'utc'</c>, so the database
+/// session's time zone does not matter.</para>
+/// </remarks>
+public class PostgresMessageBus : MessageBusBase
 {
-    private readonly CancellationTokenSource _cts = new();
-    private int _disposed;
-    private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Guid, DateTimeOffset, Task>>> _handlers = new();
-    private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Task>>> _faultHandlers = new();
-    private readonly ConcurrentDictionary<Type, Func<string, Exception, int, Task>> _faultDispatchers = new();
-    private readonly Task _pollingTask;
-    private readonly ILogger _logger;
+    private const int PurgeBatchSize = 5000;
+    private const string UtcNow = "(now() AT TIME ZONE 'utc')";
     private readonly SqlTransportOptions _options;
-    private readonly IServiceProvider? _serviceProvider;
 
     public PostgresMessageBus(SqlTransportOptions options, ILogger logger, IServiceProvider? serviceProvider = null)
+        : base(options, logger, serviceProvider, "postgres")
     {
-        _options = options ?? throw new ArgumentNullException(nameof(options));
-        _logger  = logger  ?? throw new ArgumentNullException(nameof(logger));
-        _serviceProvider = serviceProvider;
-        // Yield to the caller so Subscribe() calls made immediately after construction
-        // are registered before the first poll cycle runs.
-        _pollingTask = Task.Run(async () => { await Task.Yield(); await ProcessMessagesAsync(); });
+        _options = options;
+        StartPolling();
     }
+
+    private string Table => $"{_options.Schema}.workqueue";
+
+    // ── Publishing ──────────────────────────────────────────────────────────
 
     /// <inheritdoc />
-    public bool IsPolling => !_pollingTask.IsCompleted && !_pollingTask.IsFaulted;
-
-    /// <inheritdoc />
-    public void Subscribe<T>(IConsumer<T> consumer)
+    /// <remarks>
+    /// <paramref name="connection"/> must be an <see cref="NpgsqlConnection"/> to the database the bus
+    /// polls and <paramref name="transaction"/> (when supplied) an <see cref="NpgsqlTransaction"/> on it.
+    /// </remarks>
+    public override async Task<Guid> Publish<T>(T message, DbConnection connection, DbTransaction? transaction,
+        PublishOptions? options = null, CancellationToken cancellationToken = default)
     {
-        var handlers = _handlers.GetOrAdd(typeof(T),
-            _ => new ConcurrentDictionary<object, Func<object, Guid, DateTimeOffset, Task>>());
-        handlers.TryAdd(consumer, async (obj, messageId, sentTime) =>
-        {
-            if (obj is T message)
-                await consumer.Consume(new SimpleConsumeContext<T>(message, _cts.Token, messageId, sentTime));
-        });
-        EnsureFaultDispatcher<T>();
+        if (connection is not NpgsqlConnection npgsqlConnection)
+            throw new ArgumentException("connection must be an NpgsqlConnection", nameof(connection));
+        if (transaction != null && transaction is not NpgsqlTransaction)
+            throw new ArgumentException("transaction must be an NpgsqlTransaction", nameof(transaction));
+
+        if (npgsqlConnection.State == ConnectionState.Closed)
+            await npgsqlConnection.OpenAsync(cancellationToken);
+
+        var channel = ChannelName<T>();
+        var messageId = Guid.NewGuid();
+        await InsertAsync(npgsqlConnection, transaction as NpgsqlTransaction, channel, JsonSerializer.Serialize(message),
+            messageId, options ?? new PublishOptions(), cancellationToken);
+        RecordPublished(channel);
+        return messageId;
     }
 
-    /// <summary>
-    /// Registers a scoped consumer resolved fresh from an <see cref="IServiceScope"/> on every
-    /// message dispatch. Requires <see cref="IServiceProvider"/> to have been passed to the
-    /// constructor (automatically supplied by <see cref="PostgresMigrationHostedServiceExtensions.AddPostgresMessageBus"/>).
-    /// </summary>
-    public void Subscribe<TMessage, TConsumer>() where TConsumer : class, IConsumer<TMessage>
+    private protected override async Task InsertAsync(string channel, string payload, Guid messageId,
+        PublishOptions options, CancellationToken cancellationToken)
     {
-        if (_serviceProvider == null)
-            throw new InvalidOperationException(
-                "Scoped consumer registration requires IServiceProvider. " +
-                "Pass serviceProvider to the PostgresMessageBus constructor, " +
-                "or use the AddPostgresMessageBus DI extension.");
-
-        var handlers = _handlers.GetOrAdd(typeof(TMessage),
-            _ => new ConcurrentDictionary<object, Func<object, Guid, DateTimeOffset, Task>>());
-        handlers.TryAdd(typeof(TConsumer), async (obj, messageId, sentTime) =>
-        {
-            if (obj is TMessage message)
-            {
-                await using var scope = _serviceProvider.CreateAsyncScope();
-                var consumer = scope.ServiceProvider.GetRequiredService<TConsumer>();
-                await consumer.Consume(new SimpleConsumeContext<TMessage>(message, _cts.Token, messageId, sentTime));
-            }
-        });
-        EnsureFaultDispatcher<TMessage>();
-    }
-
-    /// <inheritdoc />
-    public void SubscribeFault<T>(IConsumer<Fault<T>> consumer)
-    {
-        var handlers = _faultHandlers.GetOrAdd(typeof(T),
-            _ => new ConcurrentDictionary<object, Func<object, Task>>());
-        handlers.TryAdd(consumer, async obj =>
-        {
-            if (obj is Fault<T> fault)
-                await consumer.Consume(new SimpleConsumeContext<Fault<T>>(fault, _cts.Token));
-        });
-    }
-
-    private void EnsureFaultDispatcher<T>()
-    {
-        _faultDispatchers.TryAdd(typeof(T), async (payload, ex, attemptCount) =>
-        {
-            if (!_faultHandlers.TryGetValue(typeof(T), out var handlers) || handlers.IsEmpty)
-                return;
-
-            var original = LegacyJsonDeserializer.Deserialize(payload, typeof(T));
-            if (original is not T typedOriginal) return;
-
-            var fault = new Fault<T>
-            {
-                OriginalMessage  = typedOriginal,
-                ExceptionType    = ex.GetType().FullName ?? ex.GetType().Name,
-                ExceptionMessage = ex.Message,
-                StackTrace       = ex.StackTrace,
-                FaultedAt        = DateTimeOffset.UtcNow,
-                AttemptCount     = attemptCount
-            };
-
-            await Task.WhenAll(handlers.Values.Select(h => h(fault)));
-        });
-    }
-
-    /// <inheritdoc />
-    public async Task Publish<T>(T message, CancellationToken cancellationToken = default)
-    {
-        var channel = typeof(T).FullName
-            ?? throw new InvalidOperationException($"Cannot determine channel name for type {typeof(T)}");
-
-        if (channel.Length > 500)
-            throw new ArgumentException($"Message type name exceeds 500 characters: {channel}");
-
-        var payload = JsonSerializer.Serialize(message);
         await using var conn = new NpgsqlConnection(_options.ConnectionString);
         await conn.OpenAsync(cancellationToken);
-        var sql = $"INSERT INTO {_options.Schema}.workqueue(channel, payload) VALUES(@channel, @payload)";
-        await using var cmd = new NpgsqlCommand(sql, conn);
+        await InsertAsync(conn, null, channel, payload, messageId, options, cancellationToken);
+    }
+
+    private async Task InsertAsync(NpgsqlConnection conn, NpgsqlTransaction? tran, string channel, string payload,
+        Guid messageId, PublishOptions options, CancellationToken cancellationToken)
+    {
+        await using var cmd = new NpgsqlCommand($"""
+            INSERT INTO {Table} (channel, payload, messageid, timecreatedutc, scheduledfor, expiresat)
+            VALUES (@channel, @payload, @messageid, {UtcNow}, @scheduledfor, @expiresat)
+            """, conn, tran);
         cmd.Parameters.AddWithValue("@channel", channel);
         cmd.Parameters.AddWithValue("@payload", payload);
+        cmd.Parameters.AddWithValue("@messageid", messageId);
+        cmd.Parameters.Add(TimestampParam("@scheduledfor", options.DeliverAfter?.UtcDateTime));
+        cmd.Parameters.Add(TimestampParam("@expiresat", options.ExpiresAt?.UtcDateTime));
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    /// <inheritdoc />
-    public async Task Publish<T>(T message, DateTimeOffset deliverAfter, CancellationToken cancellationToken = default)
-    {
-        var channel = typeof(T).FullName
-            ?? throw new InvalidOperationException($"Cannot determine channel name for type {typeof(T)}");
-
-        if (channel.Length > 500)
-            throw new ArgumentException($"Message type name exceeds 500 characters: {channel}");
-
-        var payload = JsonSerializer.Serialize(message);
-        await using var conn = new NpgsqlConnection(_options.ConnectionString);
-        await conn.OpenAsync(cancellationToken);
-        var sql = $"INSERT INTO {_options.Schema}.workqueue(channel, payload, scheduledfor) VALUES(@channel, @payload, @scheduledfor)";
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@channel", channel);
-        cmd.Parameters.AddWithValue("@payload", payload);
-        cmd.Parameters.Add(new NpgsqlParameter("@scheduledfor", NpgsqlTypes.NpgsqlDbType.Timestamp)
+    // Columns are TIMESTAMP (without time zone) holding UTC.
+    private static NpgsqlParameter TimestampParam(string name, DateTime? utc) =>
+        new(name, NpgsqlDbType.Timestamp)
         {
-            Value = DateTime.SpecifyKind(deliverAfter.UtcDateTime, DateTimeKind.Unspecified)
-        });
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
-    }
+            Value = utc.HasValue ? DateTime.SpecifyKind(utc.Value, DateTimeKind.Unspecified) : DBNull.Value
+        };
 
-    /// <inheritdoc />
-    public async Task<int> ReplayDeadLettered<T>(CancellationToken cancellationToken = default)
+    // ── Claiming ────────────────────────────────────────────────────────────
+
+    private protected override async Task<ClaimedBatch> ClaimAsync(string[] channels, int maxMessages, CancellationToken cancellationToken)
     {
-        var channel = typeof(T).FullName
-            ?? throw new InvalidOperationException($"Cannot determine channel name for type {typeof(T)}");
-
-        await using var conn = new NpgsqlConnection(_options.ConnectionString);
-        await conn.OpenAsync(cancellationToken);
-        var sql = $"""
-            UPDATE {_options.Schema}.workqueue
-            SET failedat = NULL, retrycount = 0, scheduledfor = NULL
-            WHERE channel = @channel AND failedat IS NOT NULL
-            """;
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@channel", channel);
-        return await cmd.ExecuteNonQueryAsync(cancellationToken);
-    }
-
-    private async Task ProcessMessagesAsync()
-    {
-        while (!_cts.Token.IsCancellationRequested)
-        {
-            try
-            {
-                int processedCount = await ClaimMessagesAsync(_options.MaxBatchSize);
-                if (processedCount == 0)
-                    await WaitAsync();
-            }
-            catch (TaskCanceledException) { }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error in PostgresMessageBus polling loop");
-                try { await Task.Delay(1000, _cts.Token); } catch (TaskCanceledException) { }
-            }
-        }
-    }
-
-    private async Task WaitAsync()
-    {
-        if (!_options.ContinuousPolling)
-            await Task.Delay(_options.MaxWaitTime, _cts.Token);
-    }
-
-    private async Task<int> ClaimMessagesAsync(int maxMessages)
-    {
-        if (_handlers.Count == 0) return 0;
-
-        var channelNames = _handlers.Keys
-            .Select(t => t.FullName)
-            .OfType<string>()
-            .ToArray();
-
-        if (channelNames.Length == 0) return 0;
-
-        var messages = new List<MessageDto>();
-
-        await using var conn = new NpgsqlConnection(_options.ConnectionString);
-        await conn.OpenAsync();
-        await using var tran = await conn.BeginTransactionAsync();
-
-        var selectSql = $"""
-            SELECT id, channel, payload, retrycount, messageid, timecreatedutc
-            FROM {_options.Schema}.workqueue
+        // Rows held by a live lease are skipped, so lease and transaction claimers can share a table.
+        var due = $"""
+            SELECT id FROM {Table}
             WHERE timeprocessedutc IS NULL
               AND failedat IS NULL
-              AND (scheduledfor IS NULL OR scheduledfor <= CURRENT_TIMESTAMP)
+              AND (scheduledfor IS NULL OR scheduledfor <= {UtcNow})
+              AND (lockeduntil IS NULL OR lockeduntil < {UtcNow})
               AND channel = ANY(@channels)
             ORDER BY timecreatedutc
             FOR UPDATE SKIP LOCKED
             LIMIT @maxMessages
             """;
+        const string columns = "id, channel, payload, retrycount, messageid, timecreatedutc, expiresat";
 
-        await using (var cmd = new NpgsqlCommand(selectSql, conn, tran))
+        var conn = new NpgsqlConnection(_options.ConnectionString);
+        try
         {
-            cmd.Parameters.AddWithValue("@channels", channelNames);
-            cmd.Parameters.AddWithValue("@maxMessages", maxMessages);
-            await using var reader = await cmd.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                messages.Add(new MessageDto
-                {
-                    Id             = reader.GetInt32(0),
-                    Channel        = reader.GetString(1),
-                    Payload        = reader.GetString(2),
-                    RetryCount     = reader.GetInt32(3),
-                    MessageId      = reader.GetGuid(4),
-                    TimeCreatedUtc = reader.GetDateTime(5)
-                });
-            }
-        }
+            await conn.OpenAsync(cancellationToken);
 
-        foreach (var msg in messages)
-        {
-            bool success = false;
-            Exception? lastException = null;
-            try
+            if (_options.ClaimLease is { } lease)
             {
-                await DispatchMessageAsync(msg);
-                success = true;
-            }
-            catch (Exception ex)
-            {
-                lastException = ex;
-                _logger.LogError(ex, "Handler failed for message {Id} on channel {Channel}", msg.Id, msg.Channel);
-            }
-
-            if (success)
-            {
-                await using var updateCmd = new NpgsqlCommand(
-                    $"UPDATE {_options.Schema}.workqueue SET timeprocessedutc = CURRENT_TIMESTAMP WHERE id = @id",
-                    conn, tran);
-                updateCmd.Parameters.AddWithValue("id", msg.Id);
-                await updateCmd.ExecuteNonQueryAsync();
+                var token = Guid.NewGuid();
+                await using var cmd = new NpgsqlCommand($"""
+                    UPDATE {Table}
+                    SET lockeduntil = {UtcNow} + @leaseMs * interval '1 millisecond', locktoken = @token
+                    WHERE id IN ({due})
+                    RETURNING {columns}
+                    """, conn);
+                cmd.Parameters.AddWithValue("@channels", channels);
+                cmd.Parameters.AddWithValue("@maxMessages", maxMessages);
+                cmd.Parameters.AddWithValue("@leaseMs", lease.TotalMilliseconds);
+                cmd.Parameters.AddWithValue("@token", token);
+                var messages = await ReadMessagesAsync(cmd, cancellationToken);
+                return new Batch(this, conn, null, token, messages);
             }
             else
             {
-                bool willDeadLetter = msg.RetryCount + 1 >= _options.MaxRetries;
-
-                // When a retry delay is configured and the message won't be dead-lettered, hold it back.
-                DateTime? scheduledFor = !willDeadLetter && _options.RetryDelay > TimeSpan.Zero
-                    ? DateTime.SpecifyKind(DateTime.UtcNow.Add(_options.RetryDelay), DateTimeKind.Unspecified)
-                    : (DateTime?)null;
-
-                await using var retryCmd = new NpgsqlCommand($"""
-                    UPDATE {_options.Schema}.workqueue
-                    SET retrycount = retrycount + 1,
-                        failedat = CASE WHEN retrycount + 1 >= @maxRetries THEN CURRENT_TIMESTAMP ELSE NULL END,
-                        scheduledfor = @scheduledFor
-                    WHERE id = @id
+                var tran = await conn.BeginTransactionAsync(cancellationToken);
+                await using var cmd = new NpgsqlCommand($"""
+                    SELECT {columns} FROM {Table}
+                    WHERE id IN ({due})
+                    FOR UPDATE
                     """, conn, tran);
-                retryCmd.Parameters.AddWithValue("id", msg.Id);
-                retryCmd.Parameters.AddWithValue("maxRetries", _options.MaxRetries);
-                retryCmd.Parameters.Add(new NpgsqlParameter("scheduledFor", NpgsqlTypes.NpgsqlDbType.Timestamp)
-                {
-                    Value = scheduledFor.HasValue ? (object)scheduledFor.Value : DBNull.Value
-                });
-                await retryCmd.ExecuteNonQueryAsync();
-
-                if (willDeadLetter && lastException != null)
-                {
-                    var msgType = _handlers.Keys.FirstOrDefault(t => t.FullName == msg.Channel);
-                    if (msgType != null && _faultDispatchers.TryGetValue(msgType, out var dispatcher))
-                    {
-                        try { await dispatcher(msg.Payload, lastException, msg.RetryCount + 1); }
-                        catch (Exception fex)
-                        {
-                            _logger.LogError(fex, "Fault consumer threw for dead-lettered message {Id}", msg.Id);
-                        }
-                    }
-                }
+                cmd.Parameters.AddWithValue("@channels", channels);
+                cmd.Parameters.AddWithValue("@maxMessages", maxMessages);
+                var messages = await ReadMessagesAsync(cmd, cancellationToken);
+                return new Batch(this, conn, tran, null, messages);
             }
         }
-
-        await tran.CommitAsync();
-        return messages.Count;
+        catch
+        {
+            await conn.DisposeAsync();
+            throw;
+        }
     }
 
-    private async Task DispatchMessageAsync(MessageDto msg)
+    private static async Task<List<MessageDto>> ReadMessagesAsync(NpgsqlCommand cmd, CancellationToken cancellationToken)
     {
-        var type = _handlers.Keys.FirstOrDefault(t => t.FullName == msg.Channel);
-        if (type == null)
+        var messages = new List<MessageDto>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
-            _logger.LogWarning("No handlers registered for channel: {Channel} — message {Id} will be skipped", msg.Channel, msg.Id);
-            return;
+            messages.Add(new MessageDto
+            {
+                Id             = reader.GetInt32(0),
+                Channel        = reader.GetString(1),
+                Payload        = reader.GetString(2),
+                RetryCount     = reader.GetInt32(3),
+                MessageId      = reader.GetGuid(4),
+                TimeCreatedUtc = reader.GetDateTime(5),
+                ExpiresAtUtc   = reader.IsDBNull(6) ? null : reader.GetDateTime(6)
+            });
+        }
+        return messages.OrderBy(m => m.TimeCreatedUtc).ThenBy(m => m.Id).ToList();
+    }
+
+    private sealed class Batch : ClaimedBatch
+    {
+        private readonly PostgresMessageBus _bus;
+        private readonly NpgsqlConnection _conn;
+        private readonly NpgsqlTransaction? _tran;
+        private readonly Guid? _leaseToken;
+
+        public Batch(PostgresMessageBus bus, NpgsqlConnection conn, NpgsqlTransaction? tran, Guid? leaseToken, List<MessageDto> messages)
+        {
+            _bus = bus;
+            _conn = conn;
+            _tran = tran;
+            _leaseToken = leaseToken;
+            Messages = messages;
         }
 
-        if (!_handlers.TryGetValue(type, out var handlers)) return;
+        // With a lease, an update only applies while this claim still holds the row.
+        private string LeaseGuard => _leaseToken.HasValue ? " AND locktoken = @token" : string.Empty;
 
-        var message = LegacyJsonDeserializer.Deserialize(msg.Payload, type);
-        var sentTime = new DateTimeOffset(msg.TimeCreatedUtc, TimeSpan.Zero);
-        await Task.WhenAll(handlers.Values.Select(h => h(message!, msg.MessageId, sentTime)));
+        public override async Task CompleteAsync(MessageDto message)
+        {
+            await using var cmd = new NpgsqlCommand($"""
+                UPDATE {_bus.Table}
+                SET timeprocessedutc = {UtcNow}, lockeduntil = NULL, locktoken = NULL
+                WHERE id = @id{LeaseGuard}
+                """, _conn, _tran);
+            await ExecuteAsync(cmd, message);
+        }
+
+        public override async Task FailAsync(MessageDto message, FailureOutcome outcome)
+        {
+            await using var cmd = new NpgsqlCommand($"""
+                UPDATE {_bus.Table}
+                SET retrycount        = @attempt,
+                    failedat          = CASE WHEN @deadLetter THEN {UtcNow} ELSE NULL END,
+                    faultdispatchedat = NULL,
+                    scheduledfor      = @scheduledFor,
+                    lasterror         = @lastError,
+                    lockeduntil       = NULL,
+                    locktoken         = NULL
+                WHERE id = @id{LeaseGuard}
+                """, _conn, _tran);
+            cmd.Parameters.AddWithValue("@attempt", outcome.Attempt);
+            cmd.Parameters.AddWithValue("@deadLetter", outcome.DeadLetter);
+            cmd.Parameters.Add(TimestampParam("@scheduledFor", outcome.ScheduledForUtc));
+            cmd.Parameters.AddWithValue("@lastError", outcome.Error.ToJson());
+            await ExecuteAsync(cmd, message);
+        }
+
+        private async Task ExecuteAsync(NpgsqlCommand cmd, MessageDto message)
+        {
+            cmd.Parameters.AddWithValue("@id", message.Id);
+            if (_leaseToken.HasValue) cmd.Parameters.AddWithValue("@token", _leaseToken.Value);
+
+            if (await cmd.ExecuteNonQueryAsync() == 0 && _leaseToken.HasValue)
+                _bus.Logger.LogWarning(
+                    "Lease on message {MessageId} expired before its outcome was recorded; it may be delivered again. Increase ClaimLease.",
+                    message.MessageId);
+        }
+
+        public override async Task CommitAsync()
+        {
+            if (_tran != null) await _tran.CommitAsync();
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            if (_tran != null) await _tran.DisposeAsync();
+            await _conn.DisposeAsync();
+        }
     }
 
-    public async ValueTask DisposeAsync()
+    // ── Faults ──────────────────────────────────────────────────────────────
+
+    // The claim pushes scheduledfor forward by the lease and commits at once, so no lock is
+    // held while fault consumers run.
+    private protected override async Task<IReadOnlyList<FaultInfo>> ClaimDueFaultsAsync(string[] channels, int maxFaults,
+        TimeSpan lease, CancellationToken cancellationToken)
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _cts.Cancel();
-        try { await _pollingTask.WaitAsync(TimeSpan.FromSeconds(10)); }
-        catch (OperationCanceledException) { }
-        catch (TimeoutException) { }
-        _cts.Dispose();
+        await using var conn = new NpgsqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand($"""
+            UPDATE {Table}
+            SET scheduledfor = {UtcNow} + @leaseMs * interval '1 millisecond'
+            WHERE id IN (
+                SELECT id FROM {Table}
+                WHERE failedat IS NOT NULL
+                  AND faultdispatchedat IS NULL
+                  AND (scheduledfor IS NULL OR scheduledfor <= {UtcNow})
+                  AND channel = ANY(@channels)
+                ORDER BY failedat
+                FOR UPDATE SKIP LOCKED
+                LIMIT @maxFaults
+            )
+            RETURNING channel, payload, messageid, retrycount, failedat, lasterror
+            """, conn);
+        cmd.Parameters.AddWithValue("@channels", channels);
+        cmd.Parameters.AddWithValue("@maxFaults", maxFaults);
+        cmd.Parameters.AddWithValue("@leaseMs", lease.TotalMilliseconds);
+
+        var due = new List<FaultInfo>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            due.Add(new FaultInfo(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetGuid(2),
+                reader.GetInt32(3),
+                new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(4), DateTimeKind.Utc)),
+                StoredError.Parse(reader.IsDBNull(5) ? null : reader.GetString(5)),
+                IsRedelivery: true));
+        }
+        return due;
+    }
+
+    private protected override async Task MarkFaultDeliveredAsync(FaultInfo fault)
+    {
+        await using var conn = new NpgsqlConnection(_options.ConnectionString);
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand($"""
+            UPDATE {Table}
+            SET faultdispatchedat = {UtcNow}
+            WHERE channel = @channel AND messageid = @messageid AND failedat IS NOT NULL
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", fault.Channel);
+        cmd.Parameters.AddWithValue("@messageid", fault.MessageId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    // ── Dead-letters, statistics and purging ────────────────────────────────
+
+    private const string ReplaySet = """
+        failedat = NULL, retrycount = 0, scheduledfor = NULL, faultdispatchedat = NULL,
+        expiresat = NULL, lockeduntil = NULL, locktoken = NULL
+        """;
+
+    /// <inheritdoc />
+    public override async Task<int> ReplayDeadLettered<T>(CancellationToken cancellationToken = default)
+    {
+        await using var conn = new NpgsqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand($"""
+            UPDATE {Table} SET {ReplaySet}
+            WHERE channel = @channel AND failedat IS NOT NULL
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", ChannelName<T>());
+        return await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public override async Task<bool> ReplayDeadLettered<T>(Guid messageId, CancellationToken cancellationToken = default)
+    {
+        await using var conn = new NpgsqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand($"""
+            UPDATE {Table} SET {ReplaySet}
+            WHERE channel = @channel AND messageid = @messageid AND failedat IS NOT NULL
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", ChannelName<T>());
+        cmd.Parameters.AddWithValue("@messageid", messageId);
+        return await cmd.ExecuteNonQueryAsync(cancellationToken) > 0;
+    }
+
+    /// <inheritdoc />
+    public override async Task<QueueStatistics> GetQueueStatistics<T>(CancellationToken cancellationToken = default)
+    {
+        var channel = ChannelName<T>();
+        await using var conn = new NpgsqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand($"""
+            SELECT
+                (SELECT COUNT(*) FROM {Table}
+                 WHERE channel = @channel AND timeprocessedutc IS NULL AND failedat IS NULL),
+                (SELECT COUNT(*) FROM {Table}
+                 WHERE channel = @channel AND failedat IS NOT NULL),
+                (SELECT COUNT(*) FROM {Table}
+                 WHERE channel = @channel AND failedat IS NOT NULL AND faultdispatchedat IS NULL),
+                (SELECT MIN(COALESCE(scheduledfor, timecreatedutc)) FROM {Table}
+                 WHERE channel = @channel AND timeprocessedutc IS NULL AND failedat IS NULL
+                   AND (scheduledfor IS NULL OR scheduledfor <= {UtcNow})),
+                {UtcNow}
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", channel);
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+
+        return new QueueStatistics
+        {
+            Channel           = channel,
+            PendingCount      = reader.GetInt64(0),
+            DeadLetteredCount = reader.GetInt64(1),
+            PendingFaultCount = reader.GetInt64(2),
+            OldestReadySince  = reader.IsDBNull(3) ? null : new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
+            CapturedAt        = new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero)
+        };
+    }
+
+    /// <inheritdoc />
+    public override async Task<IReadOnlyList<DeadLetteredMessage<T>>> GetDeadLettered<T>(int skip = 0, int take = 100,
+        CancellationToken cancellationToken = default)
+    {
+        await using var conn = new NpgsqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new NpgsqlCommand($"""
+            SELECT messageid, payload, timecreatedutc, failedat, retrycount, lasterror, faultdispatchedat
+            FROM {Table}
+            WHERE channel = @channel AND failedat IS NOT NULL
+            ORDER BY failedat DESC, id DESC
+            OFFSET @skip LIMIT @take
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", ChannelName<T>());
+        cmd.Parameters.AddWithValue("@skip", Math.Max(0, skip));
+        cmd.Parameters.AddWithValue("@take", Math.Max(0, take));
+
+        var result = new List<DeadLetteredMessage<T>>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(FaultRegistry.ToDeadLettered<T>(
+                reader.GetGuid(0),
+                reader.GetString(1),
+                new DateTimeOffset(reader.GetDateTime(2), TimeSpan.Zero),
+                new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
+                reader.GetInt32(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                !reader.IsDBNull(6)));
+        }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override Task<long> PurgeProcessed(DateTimeOffset processedBefore, CancellationToken cancellationToken = default) =>
+        PurgeAsync($"""
+            DELETE FROM {Table} WHERE id IN (
+                SELECT id FROM {Table}
+                WHERE timeprocessedutc IS NOT NULL AND timeprocessedutc < @before
+                LIMIT {PurgeBatchSize})
+            """, processedBefore, null, cancellationToken);
+
+    /// <inheritdoc />
+    public override Task<long> PurgeDeadLettered<T>(DateTimeOffset failedBefore, CancellationToken cancellationToken = default) =>
+        PurgeAsync($"""
+            DELETE FROM {Table} WHERE id IN (
+                SELECT id FROM {Table}
+                WHERE channel = @channel AND failedat IS NOT NULL AND failedat < @before
+                LIMIT {PurgeBatchSize})
+            """, failedBefore, ChannelName<T>(), cancellationToken);
+
+    // Deletes in batches so each statement stays short.
+    private async Task<long> PurgeAsync(string sql, DateTimeOffset before, string? channel, CancellationToken cancellationToken)
+    {
+        await using var conn = new NpgsqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        long total = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.Add(TimestampParam("@before", before.UtcDateTime));
+            if (channel != null) cmd.Parameters.AddWithValue("@channel", channel);
+
+            int deleted = await cmd.ExecuteNonQueryAsync(cancellationToken);
+            total += deleted;
+            if (deleted < PurgeBatchSize) return total;
+        }
     }
 }

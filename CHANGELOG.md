@@ -4,6 +4,122 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [26.1.0] — 2026-10-05
+
+### New features
+
+- **Retry backoff** — `BatchOptions.RetryBackoffMultiplier` (default `1.0`) grows `RetryDelay` on each
+  attempt; `BatchOptions.MaxRetryDelay` caps it (default one day). All transports (Redis now honours
+  `RetryDelay` too; without it Redis still retries after `ReclaimIdleTime`).
+  ```csharp
+  options.RetryDelay = TimeSpan.FromSeconds(1);
+  options.RetryBackoffMultiplier = 2.0;              // 1s, 2s, 4s, 8s …
+  options.MaxRetryDelay = TimeSpan.FromMinutes(5);
+  ```
+- **Non-retryable exceptions** — `BatchOptions.IsRetryable` (`Func<Exception, bool>`). Returning `false`
+  dead-letters the message on its first failure; `Fault<T>.NonRetryable` is `true`. All transports.
+- **Replay one dead-lettered message** — `IMessageBus.ReplayDeadLettered<T>(Guid messageId)`.
+  `Fault<T>.MessageId` carries the id. All transports.
+- **Transactional publish (outbox)** — `IMessageBus.Publish<T>(message, DbConnection, DbTransaction?, PublishOptions?)`
+  inserts on the caller's transaction and returns the message id. PostgreSQL, SQL Server and SQLite.
+  On Redis, `RedisMessageBus.Publish<T>(message, ITransaction, PublishOptions?)` queues the publish on the
+  caller's `MULTI`/`EXEC`. Replaces using `IWorkQueue.Enqueue` as an outbox.
+- **Message expiry** — `PublishOptions.ExpiresAt` / `TimeToLive`, via the new
+  `IMessageBus.Publish<T>(message, PublishOptions)`. A message still undelivered when it expires is
+  dead-lettered without calling consumers; `Fault<T>.Expired` and `DeadLetteredMessage<T>.Expired` are set
+  and the exception type is `MessageExpiredException`. All transports.
+- **Lease-based claiming** — `BatchOptions.ClaimLease` (PostgreSQL, SQL Server). Claims are held by a
+  lease (`lockeduntil` / `locktoken`) instead of an open transaction, so no row locks stay open while
+  consumers run. A crashed claim becomes available when the lease expires. SQLite uses `ClaimLease`
+  in place of `LockTimeout` when set.
+- **Purging** — `IMessageBus.PurgeProcessed(processedBefore)` and `PurgeDeadLettered<T>(failedBefore)`
+  delete old rows in batches. All transports; on Redis, streams are trimmed no further than any
+  consumer group still needs.
+- **Redis scheduled delivery** — `Publish(message, deliverAfter)` / `PublishOptions.DeliverAfter` now
+  work on Redis (previously `NotSupportedException`), using a `{prefix}:stream:{type}:scheduled` sorted set.
+- **Bounded concurrency** — `BatchOptions.MaxConcurrency` (default `1`) runs that many polling loops
+  in one bus. `IsPolling` is `true` only while every loop is running. All transports.
+- **Metrics** — every transport emits counters for published, processed, retried, dead-lettered and
+  expired messages and a consumer duration histogram on the `TownSuite.WorkQueues` meter
+  (`WorkQueueMetrics`). `WorkQueueMetrics.TrackQueue<T>(bus)` adds `queue.pending`, `queue.deadlettered`,
+  `queue.pending_faults` and `queue.oldest_ready_age` gauges, refreshed in the background.
+- **Health checks** — new `TownSuite.WorkQueues.HealthChecks` package:
+  `AddHealthChecks().AddMessageBus(o => o.Queue<T>(q => …))` reports a stopped polling loop as
+  unhealthy and per-queue thresholds (oldest age, pending, dead-lettered, undelivered faults) as degraded.
+- **Queue statistics** — `IMessageBus.GetQueueStatistics<T>()` returns pending, dead-lettered and
+  pending-fault counts and the age of the oldest deliverable message, for health checks and alerting.
+  All transports.
+- **At-least-once `Fault<T>` delivery** — a fault whose consumer throws, or whose process stops before
+  the consumer finishes, is delivered again after `BatchOptions.FaultRedeliveryDelay` (default one
+  minute) by any bus with a fault consumer for the type. `Fault<T>.IsRedelivery` marks redeliveries.
+  A bus with only `SubscribeFault<T>` now delivers faults too. All transports.
+- **List dead-lettered messages** — `IMessageBus.GetDeadLettered<T>(skip, take)` returns dead-letters
+  newest first with the last exception type, message and stack trace, and whether the fault was
+  delivered. All transports.
+
+### Fixes
+
+- **PostgreSQL timestamps depended on the session time zone** — `CURRENT_TIMESTAMP` was stored in
+  `TIMESTAMP` columns and compared with UTC values, so a non-UTC session shifted scheduled delivery
+  and retry times. All PostgreSQL timestamps now use `now() AT TIME ZONE 'utc'`, and the
+  `timecreatedutc` default is changed to match. Rows written earlier by a non-UTC session keep their
+  local-time values.
+- **`Fault<T>` consumers ran before the dead-letter was committed** (PostgreSQL, SQL Server). They now
+  run after the claim transaction commits, so a failed commit no longer reports a dead-letter that
+  did not happen, and a fault consumer that reads the row no longer blocks on its lock.
+- **A throwing `Fault<T>` consumer lost the fault** — it was logged and dropped. It is now redelivered.
+
+### Schema changes
+
+The migration hosted services apply these automatically. For manually managed schemas, apply them in
+order — **the backfill matters**: without it, every existing dead-letter is treated as a fault that was
+never delivered and is sent to fault consumers after the upgrade.
+
+| Change | SQL Server |
+|---|---|
+| `lasterror` column | `ALTER TABLE dbo.workqueue ADD lasterror NVARCHAR(MAX) NULL` |
+| `faultdispatchedat` column | `ALTER TABLE dbo.workqueue ADD faultdispatchedat DATETIME NULL` |
+| Backfill existing dead-letters | `UPDATE dbo.workqueue SET faultdispatchedat = failedat WHERE failedat IS NOT NULL` |
+| Dead-letter index | `CREATE NONCLUSTERED INDEX IX_workqueue_channel_deadlettered ON dbo.workqueue (channel, messageid) WHERE failedat IS NOT NULL` |
+| Pending-fault index | `CREATE NONCLUSTERED INDEX IX_workqueue_channel_pendingfault ON dbo.workqueue (channel, failedat) WHERE failedat IS NOT NULL AND faultdispatchedat IS NULL` |
+| `expiresat`, `lockeduntil`, `locktoken` columns | `ALTER TABLE dbo.workqueue ADD expiresat DATETIME NULL, lockeduntil DATETIME NULL, locktoken UNIQUEIDENTIFIER NULL` |
+| Processed index (purge) | `CREATE NONCLUSTERED INDEX IX_workqueue_processed ON dbo.workqueue (timeprocessedutc) WHERE timeprocessedutc IS NOT NULL` |
+
+PostgreSQL and SQLite use the same columns (`TIMESTAMP`/`UUID`/`TEXT`), backfill and partial indexes; see
+`scripts/postgresql/public.WorkQueue.sql` and `SqliteMigrationHostedService`. PostgreSQL also changes the
+`timecreatedutc` default to `(now() AT TIME ZONE 'utc')`.
+
+Redis adds `{prefix}:stream:{type}:scheduled` (sorted set) and `{prefix}:channels` (set of known
+streams, used by `PurgeProcessed`), and keeps pending faults in `{prefix}:stream:{type}:faults` (sorted set) and
+`{prefix}:stream:{type}:faultdata` (hash), and adds `sentat`, `failedat`, `attempts` and `lasterror`
+fields to dead-letter entries. Entries dead-lettered by earlier versions list as fault-delivered.
+
+### Deprecations
+
+- `IWorkQueue`, `DbBackedWorkQueue`, `DbBackedWorkQueue_NonDestructive`, `IRedisWorkQueue`,
+  `RedisWorkQueue` and `AddRedisWorkQueue` are `[Obsolete]` with diagnostic id `TSWQ001`. They keep
+  working; use the message bus for new code (see MIGRATING.md) and suppress `TSWQ001` while migrating.
+
+### Internal
+
+- The four transports now share `MessageBusBase` (subscriptions, polling, dispatch, retry and
+  dead-letter decisions, expiry, fault delivery, metrics); each supplies only storage operations.
+- Tests run on both `net8.0` and `net10.0`.
+
+### Behaviour notes
+
+- `Publish` now writes `messageid` explicitly instead of relying on the column default.
+- A dead-lettered row's `scheduledfor` now holds its fault redelivery time.
+- `lasterror` is recorded on every failed attempt, not only the last.
+- New `IMessageBus` members have default implementations that throw `NotSupportedException`, so
+  third-party implementations keep compiling.
+- The core package now depends on `Microsoft.Extensions.Logging.Abstractions` and
+  `Microsoft.Extensions.DependencyInjection.Abstractions` (already dependencies of every transport).
+- Every claim query skips rows with a live lease, so `lockeduntil` / `locktoken` must exist even if
+  `ClaimLease` is not used.
+
+---
+
 ## [2.5.0] — 2026-06-14
 
 ### New features

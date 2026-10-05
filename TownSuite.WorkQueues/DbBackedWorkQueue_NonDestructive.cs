@@ -13,6 +13,7 @@ namespace TownSuite.WorkQueues;
 /// Multiple workers can safely share a channel by incrementing the <c>offset</c> parameter
 /// when a row cannot be processed.
 /// </remarks>
+[Obsolete("Legacy work queue API. Use IMessageBus: Publish/Subscribe, or Publish(message, connection, transaction) to enqueue inside your own transaction. See MIGRATING.md.", DiagnosticId = "TSWQ001")]
 public class DbBackedWorkQueue_NonDestructive : DbBackedWorkQueue
 {
     [return: System.Diagnostics.CodeAnalysis.MaybeNull]

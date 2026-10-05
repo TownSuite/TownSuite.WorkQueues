@@ -1,7 +1,7 @@
 using Microsoft.Data.SqlClient;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using System.Collections.Concurrent;
+using System.Data;
+using System.Data.Common;
 using System.Text.Json;
 
 namespace TownSuite.WorkQueues.SqlServer;
@@ -12,348 +12,430 @@ namespace TownSuite.WorkQueues.SqlServer;
 /// multiple concurrent consumer instances safely claim disjoint sets of messages
 /// without blocking each other.
 /// </summary>
-public class SqlServerMessageBus : IMessageBus
+/// <remarks>
+/// By default a claimed batch is held in an open transaction until every message in it is
+/// handled. Set <see cref="BatchOptions.ClaimLease"/> to hold claims with a lease instead, so no
+/// transaction or row lock stays open while consumers run.
+/// </remarks>
+public class SqlServerMessageBus : MessageBusBase
 {
-    private readonly CancellationTokenSource _cts = new();
-    private int _disposed;
-    private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Guid, DateTimeOffset, Task>>> _handlers = new();
-    private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Task>>> _faultHandlers = new();
-    private readonly ConcurrentDictionary<Type, Func<string, Exception, int, Task>> _faultDispatchers = new();
-    private readonly Task _pollingTask;
-    private readonly ILogger _logger;
+    private const int PurgeBatchSize = 5000;
     private readonly SqlServerTransportOptions _options;
-    private readonly IServiceProvider? _serviceProvider;
 
     public SqlServerMessageBus(SqlServerTransportOptions options, ILogger logger, IServiceProvider? serviceProvider = null)
+        : base(options, logger, serviceProvider, "sqlserver")
     {
-        _options = options ?? throw new ArgumentNullException(nameof(options));
-        _logger  = logger  ?? throw new ArgumentNullException(nameof(logger));
-        _serviceProvider = serviceProvider;
-        // Yield to the caller so Subscribe() calls made immediately after construction
-        // are registered before the first poll cycle runs.
-        _pollingTask = Task.Run(async () => { await Task.Yield(); await ProcessMessagesAsync(); });
+        _options = options;
+        StartPolling();
     }
+
+    private string Table => $"[{_options.Schema}].[workqueue]";
+
+    // ── Publishing ──────────────────────────────────────────────────────────
 
     /// <inheritdoc />
-    public bool IsPolling => !_pollingTask.IsCompleted && !_pollingTask.IsFaulted;
-
-    /// <inheritdoc />
-    public void Subscribe<T>(IConsumer<T> consumer)
+    /// <remarks>
+    /// <paramref name="connection"/> must be a <see cref="SqlConnection"/> to the database the bus
+    /// polls and <paramref name="transaction"/> (when supplied) a <see cref="SqlTransaction"/> on it.
+    /// </remarks>
+    public override async Task<Guid> Publish<T>(T message, DbConnection connection, DbTransaction? transaction,
+        PublishOptions? options = null, CancellationToken cancellationToken = default)
     {
-        var handlers = _handlers.GetOrAdd(typeof(T),
-            _ => new ConcurrentDictionary<object, Func<object, Guid, DateTimeOffset, Task>>());
-        handlers.TryAdd(consumer, async (obj, messageId, sentTime) =>
-        {
-            if (obj is T message)
-                await consumer.Consume(new SimpleConsumeContext<T>(message, _cts.Token, messageId, sentTime));
-        });
-        EnsureFaultDispatcher<T>();
+        if (connection is not SqlConnection sqlConnection)
+            throw new ArgumentException("connection must be a SqlConnection", nameof(connection));
+        if (transaction != null && transaction is not SqlTransaction)
+            throw new ArgumentException("transaction must be a SqlTransaction", nameof(transaction));
+
+        if (sqlConnection.State == ConnectionState.Closed)
+            await sqlConnection.OpenAsync(cancellationToken);
+
+        var channel = ChannelName<T>();
+        var messageId = Guid.NewGuid();
+        await InsertAsync(sqlConnection, transaction as SqlTransaction, channel, JsonSerializer.Serialize(message),
+            messageId, options ?? new PublishOptions(), cancellationToken);
+        RecordPublished(channel);
+        return messageId;
     }
 
-    /// <summary>
-    /// Registers a scoped consumer resolved fresh from an <see cref="IServiceScope"/> on every
-    /// message dispatch. Requires <see cref="IServiceProvider"/> to have been passed to the
-    /// constructor (automatically supplied by
-    /// <see cref="SqlServerServiceExtensions.AddSqlServerMessageBus"/>).
-    /// </summary>
-    public void Subscribe<TMessage, TConsumer>() where TConsumer : class, IConsumer<TMessage>
+    private protected override async Task InsertAsync(string channel, string payload, Guid messageId,
+        PublishOptions options, CancellationToken cancellationToken)
     {
-        if (_serviceProvider == null)
-            throw new InvalidOperationException(
-                "Scoped consumer registration requires IServiceProvider. " +
-                "Pass serviceProvider to the SqlServerMessageBus constructor, " +
-                "or use the AddSqlServerMessageBus DI extension.");
-
-        var handlers = _handlers.GetOrAdd(typeof(TMessage),
-            _ => new ConcurrentDictionary<object, Func<object, Guid, DateTimeOffset, Task>>());
-        handlers.TryAdd(typeof(TConsumer), async (obj, messageId, sentTime) =>
-        {
-            if (obj is TMessage message)
-            {
-                await using var scope = _serviceProvider.CreateAsyncScope();
-                var consumer = scope.ServiceProvider.GetRequiredService<TConsumer>();
-                await consumer.Consume(new SimpleConsumeContext<TMessage>(message, _cts.Token, messageId, sentTime));
-            }
-        });
-        EnsureFaultDispatcher<TMessage>();
-    }
-
-    /// <inheritdoc />
-    public void SubscribeFault<T>(IConsumer<Fault<T>> consumer)
-    {
-        var handlers = _faultHandlers.GetOrAdd(typeof(T),
-            _ => new ConcurrentDictionary<object, Func<object, Task>>());
-        handlers.TryAdd(consumer, async obj =>
-        {
-            if (obj is Fault<T> fault)
-                await consumer.Consume(new SimpleConsumeContext<Fault<T>>(fault, _cts.Token));
-        });
-    }
-
-    private void EnsureFaultDispatcher<T>()
-    {
-        _faultDispatchers.TryAdd(typeof(T), async (payload, ex, attemptCount) =>
-        {
-            if (!_faultHandlers.TryGetValue(typeof(T), out var handlers) || handlers.IsEmpty)
-                return;
-
-            var original = LegacyJsonDeserializer.Deserialize(payload, typeof(T));
-            if (original is not T typedOriginal) return;
-
-            var fault = new Fault<T>
-            {
-                OriginalMessage  = typedOriginal,
-                ExceptionType    = ex.GetType().FullName ?? ex.GetType().Name,
-                ExceptionMessage = ex.Message,
-                StackTrace       = ex.StackTrace,
-                FaultedAt        = DateTimeOffset.UtcNow,
-                AttemptCount     = attemptCount
-            };
-
-            await Task.WhenAll(handlers.Values.Select(h => h(fault)));
-        });
-    }
-
-    /// <inheritdoc />
-    public async Task Publish<T>(T message, CancellationToken cancellationToken = default)
-    {
-        var channel = typeof(T).FullName
-            ?? throw new InvalidOperationException($"Cannot determine channel name for {typeof(T)}");
-
-        if (channel.Length > 500)
-            throw new ArgumentException($"Message type name exceeds 500 characters: {channel}");
-
-        var payload = JsonSerializer.Serialize(message);
-
         await using var conn = new SqlConnection(_options.ConnectionString);
         await conn.OpenAsync(cancellationToken);
+        await InsertAsync(conn, null, channel, payload, messageId, options, cancellationToken);
+    }
 
-        var sql = $"INSERT INTO [{_options.Schema}].[workqueue] ([channel], [payload]) VALUES (@channel, @payload)";
-        await using var cmd = new SqlCommand(sql, conn);
+    private async Task InsertAsync(SqlConnection conn, SqlTransaction? tran, string channel, string payload,
+        Guid messageId, PublishOptions options, CancellationToken cancellationToken)
+    {
+        await using var cmd = new SqlCommand($"""
+            INSERT INTO {Table} ([channel], [payload], [messageid], [scheduledfor], [expiresat])
+            VALUES (@channel, @payload, @messageid, @scheduledfor, @expiresat)
+            """, conn, tran);
         cmd.Parameters.AddWithValue("@channel", channel);
         cmd.Parameters.AddWithValue("@payload", payload);
+        cmd.Parameters.AddWithValue("@messageid", messageId);
+        cmd.Parameters.Add(DateTimeParam("@scheduledfor", options.DeliverAfter?.UtcDateTime));
+        cmd.Parameters.Add(DateTimeParam("@expiresat", options.ExpiresAt?.UtcDateTime));
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    /// <inheritdoc />
-    public async Task Publish<T>(T message, DateTimeOffset deliverAfter, CancellationToken cancellationToken = default)
+    private static SqlParameter DateTimeParam(string name, DateTime? value) =>
+        new(name, SqlDbType.DateTime) { Value = value.HasValue ? value.Value : DBNull.Value };
+
+    // ── Claiming ────────────────────────────────────────────────────────────
+
+    private protected override async Task<ClaimedBatch> ClaimAsync(string[] channels, int maxMessages, CancellationToken cancellationToken)
     {
-        var channel = typeof(T).FullName
-            ?? throw new InvalidOperationException($"Cannot determine channel name for {typeof(T)}");
+        // SQL Server has no array parameter type. Build a safe IN clause using auto-named
+        // parameters — channel names come from typeof(T).FullName so are developer-controlled.
+        var inClause = string.Join(", ", channels.Select((_, i) => $"@ch{i}"));
 
-        if (channel.Length > 500)
-            throw new ArgumentException($"Message type name exceeds 500 characters: {channel}");
-
-        var payload = JsonSerializer.Serialize(message);
-
-        await using var conn = new SqlConnection(_options.ConnectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        var sql = $"INSERT INTO [{_options.Schema}].[workqueue] ([channel], [payload], [scheduledfor]) VALUES (@channel, @payload, @scheduledfor)";
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@channel", channel);
-        cmd.Parameters.AddWithValue("@payload", payload);
-        cmd.Parameters.Add(new SqlParameter("@scheduledfor", System.Data.SqlDbType.DateTime)
-        {
-            Value = deliverAfter.UtcDateTime
-        });
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
-    }
-
-    /// <inheritdoc />
-    public async Task<int> ReplayDeadLettered<T>(CancellationToken cancellationToken = default)
-    {
-        var channel = typeof(T).FullName
-            ?? throw new InvalidOperationException($"Cannot determine channel name for {typeof(T)}");
-
-        await using var conn = new SqlConnection(_options.ConnectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        var sql = $"""
-            UPDATE [{_options.Schema}].[workqueue]
-            SET [failedat] = NULL, [retrycount] = 0, [scheduledfor] = NULL
-            WHERE [channel] = @channel AND [failedat] IS NOT NULL
-            """;
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@channel", channel);
-        return await cmd.ExecuteNonQueryAsync(cancellationToken);
-    }
-
-    private async Task ProcessMessagesAsync()
-    {
-        while (!_cts.Token.IsCancellationRequested)
-        {
-            try
-            {
-                int processed = await ClaimMessagesAsync(_options.MaxBatchSize);
-                if (processed == 0)
-                    await WaitAsync();
-            }
-            catch (TaskCanceledException) { }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error in SqlServerMessageBus polling loop");
-                try { await Task.Delay(1000, _cts.Token); } catch (TaskCanceledException) { }
-            }
-        }
-    }
-
-    private async Task WaitAsync()
-    {
-        if (!_options.ContinuousPolling)
-            await Task.Delay(_options.MaxWaitTime, _cts.Token);
-    }
-
-    private async Task<int> ClaimMessagesAsync(int maxMessages)
-    {
-        if (_handlers.Count == 0) return 0;
-
-        var channelNames = _handlers.Keys
-            .Select(t => t.FullName)
-            .OfType<string>()
-            .ToArray();
-
-        if (channelNames.Length == 0) return 0;
-
-        // SQL Server has no array parameter type. Build a safe IN clause using
-        // auto-named parameters — channel names come from typeof(T).FullName so
-        // are developer-controlled, not user input.
-        var paramNames = Enumerable.Range(0, channelNames.Length)
-            .Select(i => $"@ch{i}")
-            .ToArray();
-        var inClause = string.Join(", ", paramNames);
-
-        // UPDLOCK + ROWLOCK + READPAST: this connection claims the rows exclusively;
-        // other connections with the same hints skip these rows rather than blocking.
-        var selectSql = $"""
-            SELECT TOP (@maxMessages) [id], [channel], [payload], [retrycount], [messageid], [timecreatedutc]
-            FROM [{_options.Schema}].[workqueue] WITH (UPDLOCK, ROWLOCK, READPAST)
+        // UPDLOCK + ROWLOCK + READPAST: this connection claims the rows exclusively; other
+        // connections with the same hints skip these rows rather than blocking. Rows held by
+        // a live lease are skipped too, so lease and transaction claimers can share a table.
+        var due = $"""
+            SELECT TOP (@maxMessages) *
+            FROM {Table} WITH (UPDLOCK, ROWLOCK, READPAST)
             WHERE [timeprocessedutc] IS NULL
               AND [failedat] IS NULL
               AND ([scheduledfor] IS NULL OR [scheduledfor] <= GETUTCDATE())
+              AND ([lockeduntil] IS NULL OR [lockeduntil] < GETUTCDATE())
               AND [channel] IN ({inClause})
             ORDER BY [timecreatedutc]
             """;
 
-        var messages = new List<MessageDto>();
-
-        await using var conn = new SqlConnection(_options.ConnectionString);
-        await conn.OpenAsync();
-        await using var tran = conn.BeginTransaction();
-
-        await using (var cmd = new SqlCommand(selectSql, conn, tran))
+        var conn = new SqlConnection(_options.ConnectionString);
+        try
         {
-            cmd.Parameters.AddWithValue("@maxMessages", maxMessages);
-            for (int i = 0; i < channelNames.Length; i++)
-                cmd.Parameters.AddWithValue(paramNames[i], channelNames[i]);
+            await conn.OpenAsync(cancellationToken);
 
-            await using var reader = await cmd.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
+            if (_options.ClaimLease is { } lease)
             {
-                messages.Add(new MessageDto
-                {
-                    Id             = reader.GetInt32(0),
-                    Channel        = reader.GetString(1),
-                    Payload        = reader.GetString(2),
-                    RetryCount     = reader.GetInt32(3),
-                    MessageId      = reader.GetGuid(4),
-                    TimeCreatedUtc = reader.GetDateTime(5)
-                });
-            }
-        }
-
-        foreach (var msg in messages)
-        {
-            bool success = false;
-            Exception? lastException = null;
-            try
-            {
-                await DispatchMessageAsync(msg);
-                success = true;
-            }
-            catch (Exception ex)
-            {
-                lastException = ex;
-                _logger.LogError(ex, "Handler failed for message {Id} on channel {Channel}",
-                    msg.Id, msg.Channel);
-            }
-
-            if (success)
-            {
-                await using var upd = new SqlCommand(
-                    $"UPDATE [{_options.Schema}].[workqueue] SET [timeprocessedutc] = GETUTCDATE() WHERE [id] = @id",
-                    conn, tran);
-                upd.Parameters.AddWithValue("@id", msg.Id);
-                await upd.ExecuteNonQueryAsync();
+                var token = Guid.NewGuid();
+                await using var cmd = new SqlCommand($"""
+                    WITH due AS ({due})
+                    UPDATE due
+                    SET [lockeduntil] = DATEADD(millisecond, @leaseMs, GETUTCDATE()), [locktoken] = @token
+                    OUTPUT inserted.[id], inserted.[channel], inserted.[payload], inserted.[retrycount],
+                           inserted.[messageid], inserted.[timecreatedutc], inserted.[expiresat]
+                    """, conn);
+                AddClaimParameters(cmd, channels, maxMessages);
+                cmd.Parameters.AddWithValue("@leaseMs", (int)Math.Min(int.MaxValue, lease.TotalMilliseconds));
+                cmd.Parameters.AddWithValue("@token", token);
+                var messages = await ReadMessagesAsync(cmd, cancellationToken);
+                return new Batch(this, conn, null, token, messages);
             }
             else
             {
-                bool willDeadLetter = msg.RetryCount + 1 >= _options.MaxRetries;
-
-                DateTime? scheduledFor = !willDeadLetter && _options.RetryDelay > TimeSpan.Zero
-                    ? DateTime.UtcNow.Add(_options.RetryDelay)
-                    : (DateTime?)null;
-
-                await using var retry = new SqlCommand($"""
-                    UPDATE [{_options.Schema}].[workqueue]
-                    SET [retrycount]   = [retrycount] + 1,
-                        [failedat]     = CASE WHEN [retrycount] + 1 >= @maxRetries
-                                              THEN GETUTCDATE() ELSE NULL END,
-                        [scheduledfor] = @scheduledFor
-                    WHERE [id] = @id
+                var tran = conn.BeginTransaction();
+                await using var cmd = new SqlCommand($"""
+                    SELECT [id], [channel], [payload], [retrycount], [messageid], [timecreatedutc], [expiresat]
+                    FROM ({due}) AS due
                     """, conn, tran);
-                retry.Parameters.AddWithValue("@id", msg.Id);
-                retry.Parameters.AddWithValue("@maxRetries", _options.MaxRetries);
-                retry.Parameters.Add(new SqlParameter("@scheduledFor", System.Data.SqlDbType.DateTime)
-                {
-                    Value = scheduledFor.HasValue ? (object)scheduledFor.Value : DBNull.Value
-                });
-                await retry.ExecuteNonQueryAsync();
-
-                if (willDeadLetter && lastException != null)
-                {
-                    var msgType = _handlers.Keys.FirstOrDefault(t => t.FullName == msg.Channel);
-                    if (msgType != null && _faultDispatchers.TryGetValue(msgType, out var dispatcher))
-                    {
-                        try { await dispatcher(msg.Payload, lastException, msg.RetryCount + 1); }
-                        catch (Exception fex)
-                        {
-                            _logger.LogError(fex, "Fault consumer threw for dead-lettered message {Id}", msg.Id);
-                        }
-                    }
-                }
+                AddClaimParameters(cmd, channels, maxMessages);
+                var messages = await ReadMessagesAsync(cmd, cancellationToken);
+                return new Batch(this, conn, tran, null, messages);
             }
         }
-
-        await tran.CommitAsync();
-        return messages.Count;
+        catch
+        {
+            await conn.DisposeAsync();
+            throw;
+        }
     }
 
-    private async Task DispatchMessageAsync(MessageDto msg)
+    private static void AddClaimParameters(SqlCommand cmd, string[] channels, int maxMessages)
     {
-        var type = _handlers.Keys.FirstOrDefault(t => t.FullName == msg.Channel);
-        if (type == null)
+        cmd.Parameters.AddWithValue("@maxMessages", maxMessages);
+        for (int i = 0; i < channels.Length; i++)
+            cmd.Parameters.AddWithValue($"@ch{i}", channels[i]);
+    }
+
+    private static async Task<List<MessageDto>> ReadMessagesAsync(SqlCommand cmd, CancellationToken cancellationToken)
+    {
+        var messages = new List<MessageDto>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
-            _logger.LogWarning(
-                "No handler registered for channel {Channel} — message {Id} will be skipped",
-                msg.Channel, msg.Id);
-            return;
+            messages.Add(new MessageDto
+            {
+                Id             = reader.GetInt32(0),
+                Channel        = reader.GetString(1),
+                Payload        = reader.GetString(2),
+                RetryCount     = reader.GetInt32(3),
+                MessageId      = reader.GetGuid(4),
+                TimeCreatedUtc = reader.GetDateTime(5),
+                ExpiresAtUtc   = reader.IsDBNull(6) ? null : reader.GetDateTime(6)
+            });
+        }
+        // OUTPUT does not preserve the CTE's order.
+        return messages.OrderBy(m => m.TimeCreatedUtc).ThenBy(m => m.Id).ToList();
+    }
+
+    private sealed class Batch : ClaimedBatch
+    {
+        private readonly SqlServerMessageBus _bus;
+        private readonly SqlConnection _conn;
+        private readonly SqlTransaction? _tran;
+        private readonly Guid? _leaseToken;
+
+        public Batch(SqlServerMessageBus bus, SqlConnection conn, SqlTransaction? tran, Guid? leaseToken, List<MessageDto> messages)
+        {
+            _bus = bus;
+            _conn = conn;
+            _tran = tran;
+            _leaseToken = leaseToken;
+            Messages = messages;
         }
 
-        if (!_handlers.TryGetValue(type, out var handlers)) return;
+        // With a lease, an update only applies while this claim still holds the row.
+        private string LeaseGuard => _leaseToken.HasValue ? " AND [locktoken] = @token" : string.Empty;
 
-        var message = LegacyJsonDeserializer.Deserialize(msg.Payload, type);
-        var sentTime = new DateTimeOffset(msg.TimeCreatedUtc, TimeSpan.Zero);
-        await Task.WhenAll(handlers.Values.Select(h => h(message!, msg.MessageId, sentTime)));
+        public override async Task CompleteAsync(MessageDto message)
+        {
+            await using var cmd = new SqlCommand($"""
+                UPDATE {_bus.Table}
+                SET [timeprocessedutc] = GETUTCDATE(), [lockeduntil] = NULL, [locktoken] = NULL
+                WHERE [id] = @id{LeaseGuard}
+                """, _conn, _tran);
+            await ExecuteAsync(cmd, message);
+        }
+
+        public override async Task FailAsync(MessageDto message, FailureOutcome outcome)
+        {
+            await using var cmd = new SqlCommand($"""
+                UPDATE {_bus.Table}
+                SET [retrycount]        = @attempt,
+                    [failedat]          = CASE WHEN @deadLetter = 1 THEN GETUTCDATE() ELSE NULL END,
+                    [faultdispatchedat] = NULL,
+                    [scheduledfor]      = @scheduledFor,
+                    [lasterror]         = @lastError,
+                    [lockeduntil]       = NULL,
+                    [locktoken]         = NULL
+                WHERE [id] = @id{LeaseGuard}
+                """, _conn, _tran);
+            cmd.Parameters.AddWithValue("@attempt", outcome.Attempt);
+            cmd.Parameters.AddWithValue("@deadLetter", outcome.DeadLetter);
+            cmd.Parameters.Add(DateTimeParam("@scheduledFor", outcome.ScheduledForUtc));
+            cmd.Parameters.AddWithValue("@lastError", outcome.Error.ToJson());
+            await ExecuteAsync(cmd, message);
+        }
+
+        private async Task ExecuteAsync(SqlCommand cmd, MessageDto message)
+        {
+            cmd.Parameters.AddWithValue("@id", message.Id);
+            if (_leaseToken.HasValue) cmd.Parameters.AddWithValue("@token", _leaseToken.Value);
+
+            if (await cmd.ExecuteNonQueryAsync() == 0 && _leaseToken.HasValue)
+                _bus.Logger.LogWarning(
+                    "Lease on message {MessageId} expired before its outcome was recorded; it may be delivered again. Increase ClaimLease.",
+                    message.MessageId);
+        }
+
+        public override async Task CommitAsync()
+        {
+            if (_tran != null) await _tran.CommitAsync();
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            if (_tran != null) await _tran.DisposeAsync();
+            await _conn.DisposeAsync();
+        }
     }
 
-    public async ValueTask DisposeAsync()
+    // ── Faults ──────────────────────────────────────────────────────────────
+
+    // The claim pushes scheduledfor forward by the lease and commits at once, so no lock is
+    // held while fault consumers run.
+    private protected override async Task<IReadOnlyList<FaultInfo>> ClaimDueFaultsAsync(string[] channels, int maxFaults,
+        TimeSpan lease, CancellationToken cancellationToken)
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _cts.Cancel();
-        try { await _pollingTask.WaitAsync(TimeSpan.FromSeconds(10)); }
-        catch (OperationCanceledException) { }
-        catch (TimeoutException) { }
-        _cts.Dispose();
+        var inClause = string.Join(", ", channels.Select((_, i) => $"@ch{i}"));
+        await using var conn = new SqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new SqlCommand($"""
+            WITH due AS (
+                SELECT TOP (@maxFaults) *
+                FROM {Table} WITH (UPDLOCK, ROWLOCK, READPAST)
+                WHERE [failedat] IS NOT NULL
+                  AND [faultdispatchedat] IS NULL
+                  AND ([scheduledfor] IS NULL OR [scheduledfor] <= GETUTCDATE())
+                  AND [channel] IN ({inClause})
+                ORDER BY [failedat]
+            )
+            UPDATE due
+            SET [scheduledfor] = DATEADD(millisecond, @leaseMs, GETUTCDATE())
+            OUTPUT inserted.[channel], inserted.[payload], inserted.[messageid],
+                   inserted.[retrycount], inserted.[failedat], inserted.[lasterror]
+            """, conn);
+        cmd.Parameters.AddWithValue("@maxFaults", maxFaults);
+        cmd.Parameters.AddWithValue("@leaseMs", (int)Math.Min(int.MaxValue, lease.TotalMilliseconds));
+        for (int i = 0; i < channels.Length; i++)
+            cmd.Parameters.AddWithValue($"@ch{i}", channels[i]);
+
+        var due = new List<FaultInfo>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            due.Add(new FaultInfo(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetGuid(2),
+                reader.GetInt32(3),
+                new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero),
+                StoredError.Parse(reader.IsDBNull(5) ? null : reader.GetString(5)),
+                IsRedelivery: true));
+        }
+        return due;
+    }
+
+    private protected override async Task MarkFaultDeliveredAsync(FaultInfo fault)
+    {
+        await using var conn = new SqlConnection(_options.ConnectionString);
+        await conn.OpenAsync();
+        await using var cmd = new SqlCommand($"""
+            UPDATE {Table}
+            SET [faultdispatchedat] = GETUTCDATE()
+            WHERE [channel] = @channel AND [messageid] = @messageid AND [failedat] IS NOT NULL
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", fault.Channel);
+        cmd.Parameters.AddWithValue("@messageid", fault.MessageId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    // ── Dead-letters, statistics and purging ────────────────────────────────
+
+    /// <inheritdoc />
+    public override async Task<int> ReplayDeadLettered<T>(CancellationToken cancellationToken = default)
+    {
+        await using var conn = new SqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new SqlCommand($"""
+            UPDATE {Table}
+            SET [failedat] = NULL, [retrycount] = 0, [scheduledfor] = NULL, [faultdispatchedat] = NULL,
+                [expiresat] = NULL, [lockeduntil] = NULL, [locktoken] = NULL
+            WHERE [channel] = @channel AND [failedat] IS NOT NULL
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", ChannelName<T>());
+        return await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public override async Task<bool> ReplayDeadLettered<T>(Guid messageId, CancellationToken cancellationToken = default)
+    {
+        await using var conn = new SqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new SqlCommand($"""
+            UPDATE {Table}
+            SET [failedat] = NULL, [retrycount] = 0, [scheduledfor] = NULL, [faultdispatchedat] = NULL,
+                [expiresat] = NULL, [lockeduntil] = NULL, [locktoken] = NULL
+            WHERE [channel] = @channel AND [messageid] = @messageid AND [failedat] IS NOT NULL
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", ChannelName<T>());
+        cmd.Parameters.AddWithValue("@messageid", messageId);
+        return await cmd.ExecuteNonQueryAsync(cancellationToken) > 0;
+    }
+
+    /// <inheritdoc />
+    public override async Task<QueueStatistics> GetQueueStatistics<T>(CancellationToken cancellationToken = default)
+    {
+        var channel = ChannelName<T>();
+        await using var conn = new SqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new SqlCommand($"""
+            SELECT
+                (SELECT COUNT_BIG(*) FROM {Table}
+                 WHERE [channel] = @channel AND [timeprocessedutc] IS NULL AND [failedat] IS NULL),
+                (SELECT COUNT_BIG(*) FROM {Table}
+                 WHERE [channel] = @channel AND [failedat] IS NOT NULL),
+                (SELECT COUNT_BIG(*) FROM {Table}
+                 WHERE [channel] = @channel AND [failedat] IS NOT NULL AND [faultdispatchedat] IS NULL),
+                (SELECT MIN(COALESCE([scheduledfor], [timecreatedutc])) FROM {Table}
+                 WHERE [channel] = @channel AND [timeprocessedutc] IS NULL AND [failedat] IS NULL
+                   AND ([scheduledfor] IS NULL OR [scheduledfor] <= GETUTCDATE())),
+                GETUTCDATE()
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", channel);
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+
+        return new QueueStatistics
+        {
+            Channel           = channel,
+            PendingCount      = reader.GetInt64(0),
+            DeadLetteredCount = reader.GetInt64(1),
+            PendingFaultCount = reader.GetInt64(2),
+            OldestReadySince  = reader.IsDBNull(3) ? null : new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
+            CapturedAt        = new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero)
+        };
+    }
+
+    /// <inheritdoc />
+    public override async Task<IReadOnlyList<DeadLetteredMessage<T>>> GetDeadLettered<T>(int skip = 0, int take = 100,
+        CancellationToken cancellationToken = default)
+    {
+        await using var conn = new SqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+        await using var cmd = new SqlCommand($"""
+            SELECT [messageid], [payload], [timecreatedutc], [failedat], [retrycount], [lasterror], [faultdispatchedat]
+            FROM {Table}
+            WHERE [channel] = @channel AND [failedat] IS NOT NULL
+            ORDER BY [failedat] DESC, [id] DESC
+            OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", ChannelName<T>());
+        cmd.Parameters.AddWithValue("@skip", Math.Max(0, skip));
+        cmd.Parameters.AddWithValue("@take", Math.Max(0, take));
+
+        var result = new List<DeadLetteredMessage<T>>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(FaultRegistry.ToDeadLettered<T>(
+                reader.GetGuid(0),
+                reader.GetString(1),
+                new DateTimeOffset(reader.GetDateTime(2), TimeSpan.Zero),
+                new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
+                reader.GetInt32(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                !reader.IsDBNull(6)));
+        }
+        return result;
+    }
+
+    /// <inheritdoc />
+    public override Task<long> PurgeProcessed(DateTimeOffset processedBefore, CancellationToken cancellationToken = default) =>
+        PurgeAsync($"""
+            DELETE TOP ({PurgeBatchSize}) FROM {Table}
+            WHERE [timeprocessedutc] IS NOT NULL AND [timeprocessedutc] < @before
+            """, processedBefore, null, cancellationToken);
+
+    /// <inheritdoc />
+    public override Task<long> PurgeDeadLettered<T>(DateTimeOffset failedBefore, CancellationToken cancellationToken = default) =>
+        PurgeAsync($"""
+            DELETE TOP ({PurgeBatchSize}) FROM {Table}
+            WHERE [channel] = @channel AND [failedat] IS NOT NULL AND [failedat] < @before
+            """, failedBefore, ChannelName<T>(), cancellationToken);
+
+    // Deletes in batches so each statement stays short and below lock escalation.
+    private async Task<long> PurgeAsync(string sql, DateTimeOffset before, string? channel, CancellationToken cancellationToken)
+    {
+        await using var conn = new SqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        long total = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.Add(DateTimeParam("@before", before.UtcDateTime));
+            if (channel != null) cmd.Parameters.AddWithValue("@channel", channel);
+
+            int deleted = await cmd.ExecuteNonQueryAsync(cancellationToken);
+            total += deleted;
+            if (deleted < PurgeBatchSize) return total;
+        }
     }
 }

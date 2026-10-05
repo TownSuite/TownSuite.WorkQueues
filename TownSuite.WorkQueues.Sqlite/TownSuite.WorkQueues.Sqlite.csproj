@@ -5,7 +5,7 @@
         <PackageId>TownSuite.WorkQueues.Sqlite</PackageId>
         <Description>SQLite backend for TownSuite.WorkQueues. Designed for local development where multiple processes share a single .db file. WAL mode, visibility-timeout claiming, automatic schema migration. Not for production.</Description>
         <PackageTags>workqueue;messagebus;sqlite;local-development;background-jobs;queue</PackageTags>
-        <PackageReleaseNotes>v2.5.0 — initial release of the SQLite backend. See CHANGELOG.md in the core package for full notes.</PackageReleaseNotes>
+        <PackageReleaseNotes>v26.1.0 — version aligned with TownSuite.WorkQueues 26.1.0 (message bus reliability features and schema changes). See CHANGELOG.md in the core package for full notes.</PackageReleaseNotes>
     </PropertyGroup>
 
     <ItemGroup>

@@ -53,6 +53,7 @@ public static class RedisServiceExtensions
     /// Registers <see cref="RedisWorkQueue"/> as <see cref="IRedisWorkQueue"/> singleton.
     /// Requires <see cref="IConnectionMultiplexer"/> to already be registered.
     /// </summary>
+    [Obsolete("Legacy Redis list queue without retry or dead-lettering. Use RedisMessageBus (IMessageBus). See MIGRATING.md.", DiagnosticId = "TSWQ001")]
     public static IServiceCollection AddRedisWorkQueue(
         this IServiceCollection services,
         Action<RedisOptions> configure)

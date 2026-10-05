@@ -12,6 +12,11 @@ CREATE TABLE [dbo].[workqueue](
 	[failedat]         [datetime]        NULL,
 	[retrycount]       [int]             NOT NULL CONSTRAINT [DEFAULT_WorkQueue_RetryCount]      DEFAULT (0),
 	[scheduledfor]     [datetime]        NULL,
+	[faultdispatchedat] [datetime]       NULL,
+	[lasterror]        [nvarchar](max)   NULL,
+	[expiresat]        [datetime]        NULL,
+	[lockeduntil]      [datetime]        NULL,
+	[locktoken]        UNIQUEIDENTIFIER  NULL,
 	CONSTRAINT [PK_WorkQueue] PRIMARY KEY CLUSTERED ([id] ASC)
 		WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF,
 		      ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
@@ -23,4 +28,24 @@ CREATE NONCLUSTERED INDEX [IX_WorkQueue_Channel_Unprocessed] ON [dbo].[workqueue
 	[timecreatedutc] ASC
 )
 WHERE ([timeprocessedutc] IS NULL AND [failedat] IS NULL)
+GO
+CREATE NONCLUSTERED INDEX [IX_WorkQueue_Channel_DeadLettered] ON [dbo].[workqueue]
+(
+	[channel]   ASC,
+	[messageid] ASC
+)
+WHERE ([failedat] IS NOT NULL)
+GO
+CREATE NONCLUSTERED INDEX [IX_WorkQueue_Channel_PendingFault] ON [dbo].[workqueue]
+(
+	[channel]  ASC,
+	[failedat] ASC
+)
+WHERE ([failedat] IS NOT NULL AND [faultdispatchedat] IS NULL)
+GO
+CREATE NONCLUSTERED INDEX [IX_WorkQueue_Processed] ON [dbo].[workqueue]
+(
+	[timeprocessedutc] ASC
+)
+WHERE ([timeprocessedutc] IS NOT NULL)
 GO

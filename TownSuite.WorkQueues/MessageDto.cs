@@ -32,5 +32,14 @@ namespace TownSuite.WorkQueues
 
         /// <summary>Number of failed delivery attempts so far.</summary>
         public int RetryCount { get; set; }
+
+        /// <summary>UTC time after which the message must not be delivered, if any.</summary>
+        public DateTime? ExpiresAtUtc { get; set; }
+
+        // Transport-specific state for the claimed message (for example a Redis stream entry).
+        internal object? Handle { get; set; }
+
+        // Key a pending fault for this message is stored under, when it is not the message id.
+        internal string? FaultKey { get; set; }
     }
 }

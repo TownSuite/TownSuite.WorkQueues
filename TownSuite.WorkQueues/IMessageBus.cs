@@ -46,6 +46,18 @@ public interface IMessageBus : IAsyncDisposable
             "Use PostgresMessageBus, SqlServerMessageBus, or SqliteMessageBus.");
 
     /// <summary>
+    /// Serialises <paramref name="message"/> and inserts it with per-message options such as a
+    /// delivery time or an expiry.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="message">The message to publish.</param>
+    /// <param name="options">Delivery time and expiry for this message.</param>
+    /// <param name="cancellationToken">Token to cancel the publish operation.</param>
+    /// <returns>The <see cref="ConsumeContext{T}.MessageId"/> assigned to the message.</returns>
+    Task<Guid> Publish<T>(T message, PublishOptions options, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support publish options.");
+
+    /// <summary>
     /// Registers <paramref name="consumer"/> to receive messages of type <typeparamref name="T"/>.
     /// Multiple consumers may be subscribed to the same type; each receives every message.
     /// Subscribe before the bus starts delivering — call this immediately after construction
@@ -57,7 +69,11 @@ public interface IMessageBus : IAsyncDisposable
 
     /// <summary>
     /// Registers <paramref name="consumer"/> to receive <see cref="Fault{T}"/> notifications
-    /// when messages of type <typeparamref name="T"/> are dead-lettered after exhausting retries.
+    /// when messages of type <typeparamref name="T"/> are dead-lettered.
+    /// Delivery is at-least-once: a fault whose consumer throws, or whose process stops first,
+    /// is delivered again after <c>BatchOptions.FaultRedeliveryDelay</c>, by this or any other bus
+    /// on the same store that has a fault consumer for <typeparamref name="T"/>. A bus does not
+    /// need to subscribe a consumer for <typeparamref name="T"/> itself to deliver its faults.
     /// The default no-op implementation is a no-op; override in transports that support fault routing.
     /// </summary>
     /// <typeparam name="T">The original message type whose dead-lettering should be observed.</typeparam>
@@ -73,7 +89,81 @@ public interface IMessageBus : IAsyncDisposable
     Task<int> ReplayDeadLettered<T>(CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// <see langword="true"/> while the background polling loop is running.
+    /// Serialises <paramref name="message"/> and inserts it using the caller's
+    /// <paramref name="connection"/> and <paramref name="transaction"/>, so the message is only
+    /// published if the caller's transaction commits (the transactional outbox pattern).
+    /// Transports without a relational store throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="message">The message to publish.</param>
+    /// <param name="connection">An open connection to the bus's database.</param>
+    /// <param name="transaction">The caller's transaction, or <see langword="null"/> to auto-commit.</param>
+    /// <param name="options">Optional delivery time and expiry.</param>
+    /// <param name="cancellationToken">Token to cancel the publish operation.</param>
+    /// <returns>The <see cref="ConsumeContext{T}.MessageId"/> assigned to the message.</returns>
+    Task<Guid> Publish<T>(T message, System.Data.Common.DbConnection connection,
+        System.Data.Common.DbTransaction? transaction, PublishOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support transactional publish. " +
+            "Use PostgresMessageBus, SqlServerMessageBus, or SqliteMessageBus.");
+
+    /// <summary>
+    /// Resets one dead-lettered message of type <typeparamref name="T"/>, identified by its
+    /// <see cref="ConsumeContext{T}.MessageId"/>, so it is redelivered on the next polling cycle.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="messageId">The message identifier (also available as <c>Fault&lt;T&gt;.MessageId</c>).</param>
+    /// <param name="cancellationToken">Token to cancel the operation.</param>
+    /// <returns><see langword="true"/> if a dead-lettered message was found and replayed.</returns>
+    Task<bool> ReplayDeadLettered<T>(Guid messageId, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support replaying a single message.");
+
+    /// <summary>
+    /// Lists dead-lettered messages of type <typeparamref name="T"/>, newest first, with the last
+    /// error recorded for each and whether its <see cref="Fault{T}"/> has been delivered.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="skip">Number of messages to skip, for paging.</param>
+    /// <param name="take">Maximum number of messages to return.</param>
+    /// <param name="cancellationToken">Token to cancel the query.</param>
+    Task<IReadOnlyList<DeadLetteredMessage<T>>> GetDeadLettered<T>(int skip = 0, int take = 100,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support listing dead-lettered messages.");
+
+    /// <summary>
+    /// Deletes successfully processed messages (on every channel) processed before
+    /// <paramref name="processedBefore"/>. Deletes in small batches so it can run against a busy
+    /// queue. Run it on a schedule to keep the store from growing without bound.
+    /// </summary>
+    /// <param name="processedBefore">Only messages processed before this time are deleted.</param>
+    /// <param name="cancellationToken">Token to cancel the purge between batches.</param>
+    /// <returns>The number of messages deleted.</returns>
+    Task<long> PurgeProcessed(DateTimeOffset processedBefore, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support purging.");
+
+    /// <summary>
+    /// Deletes dead-lettered messages of type <typeparamref name="T"/> that were dead-lettered
+    /// before <paramref name="failedBefore"/>, including any fault not yet delivered for them.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="failedBefore">Only messages dead-lettered before this time are deleted.</param>
+    /// <param name="cancellationToken">Token to cancel the purge between batches.</param>
+    /// <returns>The number of messages deleted.</returns>
+    Task<long> PurgeDeadLettered<T>(DateTimeOffset failedBefore, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support purging.");
+
+    /// <summary>
+    /// Returns pending and dead-letter counts and the age of the oldest waiting message for
+    /// the channel of type <typeparamref name="T"/>. Intended for health checks and metrics.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="cancellationToken">Token to cancel the query.</param>
+    Task<QueueStatistics> GetQueueStatistics<T>(CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support queue statistics.");
+
+    /// <summary>
+    /// <see langword="true"/> while every background polling loop is running.
     /// Use this to implement health checks: a <see langword="false"/> value after startup
     /// indicates the loop has stopped unexpectedly and the bus is no longer processing messages.
     /// </summary>

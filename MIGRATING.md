@@ -16,7 +16,8 @@ Answer these questions before starting:
 | Is your database PostgreSQL or SQL Server? | Continue | **Do not migrate** — Redis is the only other bus-capable backend. Keep `IWorkQueue` or switch to Redis. |
 | Are you on v2.0.0 or later? | Continue | Upgrade to v2 first (see CHANGELOG). |
 | Do you need to inspect or replay failed messages? | The bus dead-letters automatically after `MaxRetries`. Continue. | Either works. |
-| Do you need ordered, exactly-once, or transactional processing tied to your own business transaction? | **Keep `IWorkQueue`** — the bus commits internally, you cannot join its transaction. | Continue. |
+| Do you need to **publish** only if your own business transaction commits? | Use the transactional `Publish(message, cn, txn)` overload (see [Transactional publishing](#transactional-publishing)). Continue. | Continue. |
+| Must the **consumer's** work commit in the same transaction as the dequeue itself (exactly-once)? | **Keep `IWorkQueue`** — the bus claims messages in its own transaction; consumers must be idempotent. | Continue. |
 | Are you happy for the channel name to be the message type's fully-qualified name? | Continue | You can still migrate, but read the **channel name** section carefully. |
 
 ---
@@ -181,8 +182,8 @@ await _bus.Publish(payload);
 ```
 
 `Publish` opens its own connection internally. Remove the `cn` / `txn` arguments.
-If `Publish` was called inside a business transaction you want to keep atomic, see
-[Transactional publishing](#transactional-publishing) below.
+If the `Enqueue` was inside a business transaction you want to keep atomic, use
+`await _bus.Publish(payload, cn, txn)` instead — see [Transactional publishing](#transactional-publishing) below.
 
 ### Step 5 — Wire up DI
 
@@ -261,26 +262,30 @@ This is the most common migration pitfall. The table below summarises options:
 
 ---
 
+> `IWorkQueue` and `DbBackedWorkQueue` are now `[Obsolete]` (diagnostic `TSWQ001`). They keep working;
+> suppress the warning with `<NoWarn>$(NoWarn);TSWQ001</NoWarn>` until a project is migrated.
+
 ## Transactional publishing
 
-`IMessageBus.Publish` always opens its own connection. If you need "publish only if my business
-transaction commits", you cannot use the bus directly inside that transaction.
-
-**Pattern — outbox within your transaction, bus picks it up:**
+To publish only if your business transaction commits, pass your connection and transaction to
+`Publish`. The message row is inserted on your transaction, so it commits or rolls back with your
+own writes (the transactional outbox pattern):
 
 ```csharp
 // Inside your business transaction
-await workQueue.Enqueue("MyApp.Models.OrderPayload", payload, cn, txn);
+await cn.ExecuteAsync("UPDATE Orders SET Status = 'Submitted' WHERE Id = @id", new { id }, txn);
+Guid messageId = await bus.Publish(new OrderSubmitted { OrderId = id }, cn, txn);
 txn.Commit();
-
-// The bus picks up messages whose channel = typeof(OrderPayload).FullName.
-// This works because the bus polls for the type's FullName, and here we wrote
-// that exact string as the channel. Requires your DbBackedWorkQueue schema
-// to be the same table the bus reads from.
 ```
 
-This re-uses the old `IWorkQueue.Enqueue` as a transactional outbox; the bus polls and delivers.
-The channel string must exactly match `typeof(T).FullName`.
+The connection must be to the database the bus polls, of the transport's own type (`NpgsqlConnection`,
+`SqlConnection` or `SqliteConnection`). Pass `PublishOptions` to schedule the message or give it an
+expiry. The returned id is the `ConsumeContext<T>.MessageId` consumers see. On Redis, pass an
+`ITransaction` (`redisBus.Publish(message, transaction)`) to publish inside your own `MULTI`/`EXEC`.
+
+> Older versions recommended `IWorkQueue.Enqueue(typeof(T).FullName, payload, cn, txn)` for this.
+> That still works, but it needs the `workqueue_enqueue` stored procedure and does not return the
+> message id. Prefer the `Publish` overload.
 
 ---
 
@@ -313,16 +318,18 @@ WHERE channel = 'MyApp.Models.OrderPayload'
 
 | Concern | Direct WorkQueue | Message Bus |
 |---|---|---|
-| Enqueue / publish | `workQueue.Enqueue("channel", obj, cn)` | `bus.Publish(obj)` |
+| Enqueue / publish | `workQueue.Enqueue("channel", obj, cn)` | `bus.Publish(obj)`, or `bus.Publish(obj, cn, txn)` inside your transaction |
 | Dequeue / consume | `workQueue.Dequeue<T>("channel", cn, txn)` | `IConsumer<T>.Consume(ctx)` |
 | Channel name | Arbitrary string you supply | `typeof(T).FullName` (auto) |
 | Polling loop | You write it (BackgroundService) | Built into the bus |
 | Transaction | You open and commit | Bus-managed |
-| Retry on failure | Increment `offset`, loop again | Automatic, up to `MaxRetries` |
+| Retry on failure | Increment `offset`, loop again | Automatic, up to `MaxRetries`, with optional backoff |
 | Dead-letter | No built-in; you decide what to do | `failedat` column, queryable |
 | Database | PostgreSQL and SQL Server | PostgreSQL, SQL Server, Redis, SQLite |
 | Multiple consumers | Not applicable (single dequeuer per item) | Multiple `Subscribe` calls |
-| Ordered delivery | Yes (dequeue by id ascending) | Yes (poll by timecreatedutc ascending) |
+| Ordered delivery | Yes (dequeue by id ascending) | Yes with `MaxConcurrency = 1` (poll by timecreatedutc ascending) |
+| Concurrency | One dequeue per call; run more workers | `MaxConcurrency` polling loops per bus |
+| Monitoring | Query the table yourself | `WorkQueueMetrics` meter + `GetQueueStatistics<T>()` |
 
 ---
 
@@ -348,9 +355,9 @@ When asked to perform this migration on a codebase, follow this sequence:
 4. **Create `IConsumer<T>` classes** — move the body of the dequeue loop into `Consume()`.
    - Remove transaction management, null-check loops, and offset logic from the body.
    - If the old code incremented offset on failure, remove it — the bus retries automatically.
-5. **Replace `Enqueue` calls with `Publish`** — remove `cn` and `txn` arguments.
+5. **Replace `Enqueue` calls with `Publish`** — remove `cn` and `txn` arguments, unless the enqueue was inside a business transaction; then use `Publish(payload, cn, txn)`.
 6. **Wire DI** — register `SqlTransportOptions`, `AddPostgresMigrationHostedService`, and `IMessageBus`.
 7. **Delete the background workers** that contained the dequeue loops.
 8. **Ask the user about in-flight messages** before finalising — do they need a drain strategy?
-9. **Do not migrate** if the dequeue was inside a business transaction that wrote to other tables in the same commit. Flag this to the user and keep `IWorkQueue` for that site.
+9. **Do not migrate** if the dequeue was inside a business transaction that wrote to other tables in the same commit. Flag this to the user and keep `IWorkQueue` for that site. (Enqueues inside a business transaction *can* migrate, via `Publish(payload, cn, txn)`.)
 10. **Verify** the channel string written by any remaining `IWorkQueue.Enqueue` calls, if used as a transactional outbox, exactly matches `typeof(T).FullName` of the target consumer.

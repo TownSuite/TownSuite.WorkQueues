@@ -74,6 +74,8 @@ pipeline {
                             --configuration Release --no-build --output build
                         dotnet pack TownSuite.WorkQueues.Sqlite/TownSuite.WorkQueues.Sqlite.csproj \
                             --configuration Release --no-build --output build
+                        dotnet pack TownSuite.WorkQueues.HealthChecks/TownSuite.WorkQueues.HealthChecks.csproj \
+                            --configuration Release --no-build --output build
                         '''
                     }
                 }
