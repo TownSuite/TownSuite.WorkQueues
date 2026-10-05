@@ -289,6 +289,140 @@ public class MessageBusReliabilityTests
         Assert.That(counts.GetValueOrDefault("townsuite.workqueues.messages.deadlettered"), Is.EqualTo(1));
     }
 
+    [Test]
+    public async Task Sqlite_FaultConsumerThrows_FaultIsRedelivered()
+    {
+        await using var db = await SqliteDb.CreateAsync();
+        var options = db.Options(maxRetries: 1);
+        options.FaultRedeliveryDelay = TimeSpan.FromMilliseconds(300);
+
+        var faults = new FlakyFaultConsumer<OrderSubmitted>(failures: 1);
+        await using var bus = new SqliteMessageBus(options, Moq.Mock.Of<ILogger<SqliteMessageBus>>());
+        bus.Subscribe(new AlwaysThrowingConsumer<OrderSubmitted>());
+        bus.SubscribeFault(faults);
+        await bus.Publish(new OrderSubmitted { OrderId = Guid.NewGuid(), ProductName = "flaky fault" });
+
+        await WaitFor(() => faults.Delivered.Count >= 1);
+        await WaitFor(async () => (await bus.GetQueueStatistics<OrderSubmitted>()).PendingFaultCount == 0);
+
+        Assert.That(faults.Attempts, Is.EqualTo(2), "The fault should be delivered again after the consumer threw.");
+        Assert.That(faults.Delivered.Single().IsRedelivery, Is.True);
+        Assert.That(faults.Delivered.Single().ExceptionType, Is.EqualTo(typeof(InvalidOperationException).FullName));
+        Assert.That(faults.Delivered.Single().StackTrace, Is.Not.Null, "The stored error keeps the stack trace.");
+
+        var listed = (await bus.GetDeadLettered<OrderSubmitted>()).Single();
+        Assert.That(listed.FaultDelivered, Is.True);
+    }
+
+    [Test]
+    public async Task Sqlite_FaultNeverDelivered_IsDeliveredByAnotherBus()
+    {
+        await using var db = await SqliteDb.CreateAsync();
+        var options = db.Options(maxRetries: 1);
+        options.FaultRedeliveryDelay = TimeSpan.FromMilliseconds(300);
+
+        // Bus A dead-letters the message but has no fault consumer — like a worker that
+        // stopped before its fault consumer ran.
+        var busA = new SqliteMessageBus(options, Moq.Mock.Of<ILogger<SqliteMessageBus>>());
+        busA.Subscribe(new AlwaysThrowingConsumer<OrderSubmitted>());
+        await busA.Publish(new OrderSubmitted { OrderId = Guid.NewGuid(), ProductName = "orphaned fault" });
+        await WaitFor(async () => (await busA.GetQueueStatistics<OrderSubmitted>()).DeadLetteredCount == 1);
+        await busA.DisposeAsync();
+
+        var stats = await busA.GetQueueStatistics<OrderSubmitted>();
+        Assert.That(stats.PendingFaultCount, Is.EqualTo(1));
+
+        // Bus B only subscribes a fault consumer.
+        var faults = new CapturingFaultConsumer<OrderSubmitted>();
+        await using var busB = new SqliteMessageBus(options, Moq.Mock.Of<ILogger<SqliteMessageBus>>());
+        busB.SubscribeFault(faults);
+
+        await WaitFor(() => faults.Received != null);
+
+        Assert.That(faults.Received, Is.Not.Null);
+        Assert.That(faults.Received!.IsRedelivery, Is.True);
+        Assert.That(faults.Received.OriginalMessage.ProductName, Is.EqualTo("orphaned fault"));
+        Assert.That(faults.Received.AttemptCount, Is.EqualTo(1));
+        await WaitFor(async () => (await busB.GetQueueStatistics<OrderSubmitted>()).PendingFaultCount == 0);
+        Assert.That((await busB.GetQueueStatistics<OrderSubmitted>()).PendingFaultCount, Is.Zero);
+    }
+
+    [Test]
+    public async Task Sqlite_GetDeadLettered_ListsNewestFirstWithErrorsAndPages()
+    {
+        await using var db = await SqliteDb.CreateAsync();
+        var options = db.Options(maxRetries: 5);
+        options.IsRetryable = ex => ex is not ArgumentException;
+
+        await using var bus = new SqliteMessageBus(options, Moq.Mock.Of<ILogger<SqliteMessageBus>>());
+        bus.Subscribe(new ArgumentThrowingConsumer());
+        for (int i = 0; i < 3; i++)
+        {
+            await bus.Publish(new OrderSubmitted { OrderId = Guid.NewGuid(), ProductName = $"listed {i}" });
+            await WaitFor(async () => (await bus.GetQueueStatistics<OrderSubmitted>()).DeadLetteredCount == i + 1);
+        }
+
+        var all = await bus.GetDeadLettered<OrderSubmitted>();
+        Assert.That(all.Select(m => m.Message!.ProductName), Is.EqualTo(new[] { "listed 2", "listed 1", "listed 0" }));
+        Assert.That(all.All(m => m.ExceptionType == typeof(ArgumentException).FullName), Is.True);
+        Assert.That(all.All(m => m.ExceptionMessage == "Simulated permanent failure"), Is.True);
+        Assert.That(all.All(m => m.NonRetryable && m.AttemptCount == 1 && m.MessageId != Guid.Empty), Is.True);
+        Assert.That(all.All(m => m.FailedAt >= m.SentTime), Is.True);
+
+        var page = await bus.GetDeadLettered<OrderSubmitted>(skip: 1, take: 1);
+        Assert.That(page.Single().Message!.ProductName, Is.EqualTo("listed 1"));
+
+        Assert.That(await bus.ReplayDeadLettered<OrderSubmitted>(page.Single().MessageId), Is.True);
+    }
+
+    [Test]
+    public async Task Sqlite_Migration_MarksExistingDeadLettersAsNotified()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"wq-upgrade-{Guid.NewGuid()}.db");
+        var connectionString = $"Data Source={path}";
+        try
+        {
+            // A database created by an earlier version, holding one old dead-letter.
+            await using (var conn = new SqliteConnection(connectionString))
+            {
+                await conn.ExecuteAsync("""
+                    CREATE TABLE workqueue (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, messageid TEXT NOT NULL,
+                        timecreatedutc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                        channel TEXT NOT NULL, payload TEXT NOT NULL, timeprocessedutc TEXT NULL,
+                        failedat TEXT NULL, retrycount INTEGER NOT NULL DEFAULT 0, scheduledfor TEXT NULL,
+                        lockeduntil TEXT NULL, locktoken TEXT NULL);
+                    INSERT INTO workqueue(channel, payload, messageid, failedat, retrycount)
+                    VALUES(@channel, '{}', @id, '2026-01-01T00:00:00.000Z', 3);
+                    """, new { channel = typeof(OrderSubmitted).FullName, id = Guid.NewGuid().ToString() });
+            }
+
+            var options = new SqliteTransportOptions
+            {
+                ConnectionString = connectionString, ContinuousPolling = true,
+                MaxWaitTime = TimeSpan.FromMilliseconds(100), FaultRedeliveryDelay = TimeSpan.FromMilliseconds(100)
+            };
+            var sp = new ServiceCollection().AddSingleton(options).AddLogging().BuildServiceProvider();
+            await new SqliteMigrationHostedService(sp, sp.GetRequiredService<ILogger<SqliteMigrationHostedService>>())
+                .StartAsync(CancellationToken.None);
+
+            var faults = new CapturingFaultConsumer<OrderSubmitted>();
+            await using var bus = new SqliteMessageBus(options, Moq.Mock.Of<ILogger<SqliteMessageBus>>());
+            bus.SubscribeFault(faults);
+            await Task.Delay(800);
+
+            Assert.That(faults.Received, Is.Null, "Dead-letters from before the upgrade must not produce faults.");
+            Assert.That((await bus.GetQueueStatistics<OrderSubmitted>()).PendingFaultCount, Is.Zero);
+            Assert.That((await bus.GetDeadLettered<OrderSubmitted>()).Single().FaultDelivered, Is.True);
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            foreach (var f in new[] { path, path + "-wal", path + "-shm" })
+                if (File.Exists(f)) File.Delete(f);
+        }
+    }
+
     // ── SQL Server ────────────────────────────────────────────────────────────
 
     [Test]
@@ -391,7 +525,49 @@ public class MessageBusReliabilityTests
         Assert.That(consumer.CallCount, Is.EqualTo(3));
     }
 
+    [Test]
+    public async Task SqlServer_FaultRedeliveryAndListing()
+    {
+        await using var wrapper = await TestContainerWrapper.CreateContainerAsync("mssql");
+        await wrapper.StartAsync();
+
+        SqlServerTransportOptions Options() => new()
+        {
+            ConnectionString     = wrapper.Container.GetConnectionString(),
+            Schema               = "dbo",
+            ContinuousPolling    = true,
+            MaxWaitTime          = TimeSpan.FromMilliseconds(100),
+            MaxRetries           = 1,
+            FaultRedeliveryDelay = TimeSpan.FromMilliseconds(500)
+        };
+
+        await AssertFaultRedeliveryAndListing(
+            () => new SqlServerMessageBus(Options(), Moq.Mock.Of<ILogger<SqlServerMessageBus>>()),
+            bus => ((SqlServerMessageBus)bus).Subscribe(new AlwaysThrowingConsumer<OrderSubmitted>()));
+    }
+
     // ── PostgreSQL ────────────────────────────────────────────────────────────
+
+    [Test]
+    public async Task Postgres_FaultRedeliveryAndListing()
+    {
+        await using var wrapper = await TestContainerWrapper.CreateContainerAsync("postgres");
+        await wrapper.StartAsync();
+
+        SqlTransportOptions Options() => new()
+        {
+            ConnectionString     = wrapper.Container.GetConnectionString(),
+            Schema               = "public",
+            ContinuousPolling    = true,
+            MaxWaitTime          = TimeSpan.FromMilliseconds(100),
+            MaxRetries           = 1,
+            FaultRedeliveryDelay = TimeSpan.FromMilliseconds(500)
+        };
+
+        await AssertFaultRedeliveryAndListing(
+            () => new PostgresMessageBus(Options(), Moq.Mock.Of<ILogger<PostgresMessageBus>>()),
+            bus => ((PostgresMessageBus)bus).Subscribe(new AlwaysThrowingConsumer<OrderSubmitted>()));
+    }
 
     [Test]
     public async Task Postgres_ReliabilityFeatures()
@@ -511,6 +687,65 @@ public class MessageBusReliabilityTests
         Assert.That(stats.OldestReadySince, Is.Not.Null);
     }
 
+    [Test]
+    public async Task Redis_FaultRedeliveryAndListing()
+    {
+        await using var container = new RedisBuilder().Build();
+        await container.StartAsync();
+        using var mux = ConnectionMultiplexer.Connect(container.GetConnectionString());
+
+        RedisOptions Options() => new()
+        {
+            KeyPrefix            = "faultredelivery",
+            ConsumerGroup        = "test-group",
+            ConsumerName         = "test-consumer",
+            MaxWaitTime          = TimeSpan.FromMilliseconds(100),
+            MaxRetries           = 5,
+            ReclaimIdleTime      = TimeSpan.FromSeconds(30),
+            IsRetryable          = _ => false,
+            FaultRedeliveryDelay = TimeSpan.FromMilliseconds(500)
+        };
+
+        await AssertFaultRedeliveryAndListing(
+            () => new RedisMessageBus(mux, Options(), Moq.Mock.Of<ILogger<RedisMessageBus>>()),
+            bus => ((RedisMessageBus)bus).Subscribe(new AlwaysThrowingConsumer<OrderSubmitted>()));
+    }
+
+    // Bus A dead-letters with no fault consumer (as if it stopped before the fault ran). Bus B,
+    // which only has a fault consumer that throws once, must still receive the fault.
+    private static async Task AssertFaultRedeliveryAndListing(Func<IMessageBus> createBus, Action<IMessageBus> subscribeThrowing)
+    {
+        var busA = createBus();
+        subscribeThrowing(busA);
+        await busA.Publish(new OrderSubmitted { OrderId = Guid.NewGuid(), ProductName = "first" });
+        await busA.Publish(new OrderSubmitted { OrderId = Guid.NewGuid(), ProductName = "second" });
+        await WaitFor(async () => (await busA.GetQueueStatistics<OrderSubmitted>()).DeadLetteredCount == 2, timeoutMs: 10000);
+        await busA.DisposeAsync();
+
+        var stats = await busA.GetQueueStatistics<OrderSubmitted>();
+        Assert.That(stats.DeadLetteredCount, Is.EqualTo(2));
+        Assert.That(stats.PendingFaultCount, Is.EqualTo(2));
+
+        var listed = await busA.GetDeadLettered<OrderSubmitted>();
+        Assert.That(listed, Has.Count.EqualTo(2));
+        Assert.That(listed.All(m => !m.FaultDelivered && m.MessageId != Guid.Empty && m.ExceptionType != null), Is.True);
+        Assert.That(listed.Select(m => m.Message!.ProductName), Is.EquivalentTo(new[] { "first", "second" }));
+        Assert.That(await busA.GetDeadLettered<OrderSubmitted>(skip: 1, take: 5), Has.Count.EqualTo(1));
+
+        var faults = new FlakyFaultConsumer<OrderSubmitted>(failures: 1);
+        await using var busB = createBus();
+        busB.SubscribeFault(faults);
+
+        await WaitFor(() => faults.Delivered.Count >= 2, timeoutMs: 15000);
+        await WaitFor(async () => (await busB.GetQueueStatistics<OrderSubmitted>()).PendingFaultCount == 0, timeoutMs: 5000);
+
+        Assert.That(faults.Delivered, Has.Count.EqualTo(2), "Each fault should be delivered once it succeeds.");
+        Assert.That(faults.Delivered.All(f => f.IsRedelivery), Is.True);
+        Assert.That(faults.Attempts, Is.EqualTo(3), "One fault consumer failure, then two deliveries.");
+        Assert.That((await busB.GetQueueStatistics<OrderSubmitted>()).PendingFaultCount, Is.Zero);
+        Assert.That((await busB.GetDeadLettered<OrderSubmitted>()).All(m => m.FaultDelivered), Is.True);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static async Task WaitFor(Func<bool> predicate, int timeoutMs = 4000)
@@ -518,6 +753,13 @@ public class MessageBusReliabilityTests
         var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
         while (!predicate() && DateTime.UtcNow < deadline)
             await Task.Delay(25);
+    }
+
+    private static async Task WaitFor(Func<Task<bool>> predicate, int timeoutMs = 4000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (!await predicate() && DateTime.UtcNow < deadline)
+            await Task.Delay(50);
     }
 
     private sealed class SqliteDb : IAsyncDisposable
@@ -642,4 +884,19 @@ internal class CollectingFaultConsumer<T>(ConcurrentBag<Fault<T>> faults) : ICon
 internal class DelegateFaultConsumer<T>(Func<Fault<T>, Task> onFault) : IConsumer<Fault<T>>
 {
     public Task Consume(ConsumeContext<Fault<T>> context) => onFault(context.Message);
+}
+
+internal class FlakyFaultConsumer<T>(int failures) : IConsumer<Fault<T>>
+{
+    private int _attempts;
+    public int Attempts => _attempts;
+    public ConcurrentBag<Fault<T>> Delivered { get; } = new();
+
+    public Task Consume(ConsumeContext<Fault<T>> context)
+    {
+        if (Interlocked.Increment(ref _attempts) <= failures)
+            throw new InvalidOperationException("Simulated fault consumer failure");
+        Delivered.Add(context.Message);
+        return Task.CompletedTask;
+    }
 }

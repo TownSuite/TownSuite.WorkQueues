@@ -26,29 +26,50 @@ All notable changes to this project will be documented in this file.
   in one bus. `IsPolling` is `true` only while every loop is running. All transports.
 - **Metrics** — every transport emits counters for published, processed, retried and dead-lettered
   messages and a consumer duration histogram on the `TownSuite.WorkQueues` meter (`WorkQueueMetrics`).
-- **Queue statistics** — `IMessageBus.GetQueueStatistics<T>()` returns pending and dead-lettered
-  counts and the age of the oldest deliverable message, for health checks and alerting. All transports.
+- **Queue statistics** — `IMessageBus.GetQueueStatistics<T>()` returns pending, dead-lettered and
+  pending-fault counts and the age of the oldest deliverable message, for health checks and alerting.
+  All transports.
+- **At-least-once `Fault<T>` delivery** — a fault whose consumer throws, or whose process stops before
+  the consumer finishes, is delivered again after `BatchOptions.FaultRedeliveryDelay` (default one
+  minute) by any bus with a fault consumer for the type. `Fault<T>.IsRedelivery` marks redeliveries.
+  A bus with only `SubscribeFault<T>` now delivers faults too. All transports.
+- **List dead-lettered messages** — `IMessageBus.GetDeadLettered<T>(skip, take)` returns dead-letters
+  newest first with the last exception type, message and stack trace, and whether the fault was
+  delivered. All transports.
 
 ### Fixes
 
 - **`Fault<T>` consumers ran before the dead-letter was committed** (PostgreSQL, SQL Server). They now
   run after the claim transaction commits, so a failed commit no longer reports a dead-letter that
   did not happen, and a fault consumer that reads the row no longer blocks on its lock.
+- **A throwing `Fault<T>` consumer lost the fault** — it was logged and dropped. It is now redelivered.
 
 ### Schema changes
 
-A filtered index over dead-lettered rows speeds up replay and statistics. The migration hosted
-services add it automatically; for manually managed schemas:
+The migration hosted services apply these automatically. For manually managed schemas, apply them in
+order — **the backfill matters**: without it, every existing dead-letter is treated as a fault that was
+never delivered and is sent to fault consumers after the upgrade.
 
-| Database | DDL |
+| Change | SQL Server |
 |---|---|
-| SQL Server | `CREATE NONCLUSTERED INDEX IX_workqueue_channel_deadlettered ON dbo.workqueue (channel, messageid) WHERE failedat IS NOT NULL` |
-| PostgreSQL | `CREATE INDEX IF NOT EXISTS ix_workqueue_channel_deadlettered ON workqueue (channel, messageid) WHERE failedat IS NOT NULL` |
-| SQLite | `CREATE INDEX IF NOT EXISTS IX_workqueue_channel_deadlettered ON workqueue (channel, messageid) WHERE failedat IS NOT NULL` |
+| `lasterror` column | `ALTER TABLE dbo.workqueue ADD lasterror NVARCHAR(MAX) NULL` |
+| `faultdispatchedat` column | `ALTER TABLE dbo.workqueue ADD faultdispatchedat DATETIME NULL` |
+| Backfill existing dead-letters | `UPDATE dbo.workqueue SET faultdispatchedat = failedat WHERE failedat IS NOT NULL` |
+| Dead-letter index | `CREATE NONCLUSTERED INDEX IX_workqueue_channel_deadlettered ON dbo.workqueue (channel, messageid) WHERE failedat IS NOT NULL` |
+| Pending-fault index | `CREATE NONCLUSTERED INDEX IX_workqueue_channel_pendingfault ON dbo.workqueue (channel, failedat) WHERE failedat IS NOT NULL AND faultdispatchedat IS NULL` |
+
+PostgreSQL and SQLite use the same columns (`TIMESTAMP`/`TEXT`), backfill and partial indexes; see
+`scripts/postgresql/public.WorkQueue.sql` and `SqliteMigrationHostedService`.
+
+Redis keeps pending faults in `{prefix}:stream:{type}:faults` (sorted set) and
+`{prefix}:stream:{type}:faultdata` (hash), and adds `sentat`, `failedat`, `attempts` and `lasterror`
+fields to dead-letter entries. Entries dead-lettered by earlier versions list as fault-delivered.
 
 ### Behaviour notes
 
 - `Publish` now writes `messageid` explicitly instead of relying on the column default.
+- A dead-lettered row's `scheduledfor` now holds its fault redelivery time.
+- `lasterror` is recorded on every failed attempt, not only the last.
 - New `IMessageBus` members have default implementations that throw `NotSupportedException`, so
   third-party implementations keep compiling.
 

@@ -57,7 +57,11 @@ public interface IMessageBus : IAsyncDisposable
 
     /// <summary>
     /// Registers <paramref name="consumer"/> to receive <see cref="Fault{T}"/> notifications
-    /// when messages of type <typeparamref name="T"/> are dead-lettered after exhausting retries.
+    /// when messages of type <typeparamref name="T"/> are dead-lettered.
+    /// Delivery is at-least-once: a fault whose consumer throws, or whose process stops first,
+    /// is delivered again after <c>BatchOptions.FaultRedeliveryDelay</c>, by this or any other bus
+    /// on the same store that has a fault consumer for <typeparamref name="T"/>. A bus does not
+    /// need to subscribe a consumer for <typeparamref name="T"/> itself to deliver its faults.
     /// The default no-op implementation is a no-op; override in transports that support fault routing.
     /// </summary>
     /// <typeparam name="T">The original message type whose dead-lettering should be observed.</typeparam>
@@ -102,6 +106,18 @@ public interface IMessageBus : IAsyncDisposable
     /// <returns><see langword="true"/> if a dead-lettered message was found and replayed.</returns>
     Task<bool> ReplayDeadLettered<T>(Guid messageId, CancellationToken cancellationToken = default)
         => throw new NotSupportedException($"{GetType().Name} does not support replaying a single message.");
+
+    /// <summary>
+    /// Lists dead-lettered messages of type <typeparamref name="T"/>, newest first, with the last
+    /// error recorded for each and whether its <see cref="Fault{T}"/> has been delivered.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="skip">Number of messages to skip, for paging.</param>
+    /// <param name="take">Maximum number of messages to return.</param>
+    /// <param name="cancellationToken">Token to cancel the query.</param>
+    Task<IReadOnlyList<DeadLetteredMessage<T>>> GetDeadLettered<T>(int skip = 0, int take = 100,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support listing dead-lettered messages.");
 
     /// <summary>
     /// Returns pending and dead-letter counts and the age of the oldest waiting message for

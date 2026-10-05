@@ -58,7 +58,9 @@ public class SqliteMigrationHostedService : IHostedService
                     retrycount       INTEGER  NOT NULL DEFAULT 0,
                     scheduledfor     TEXT     NULL,
                     lockeduntil      TEXT     NULL,
-                    locktoken        TEXT     NULL
+                    locktoken        TEXT     NULL,
+                    faultdispatchedat TEXT    NULL,
+                    lasterror        TEXT     NULL
                 )
                 """, ct);
 
@@ -78,6 +80,18 @@ public class SqliteMigrationHostedService : IHostedService
             // IF NOT EXISTS is not universally supported for ALTER TABLE, so check PRAGMA table_info.
             await AddColumnIfMissingAsync(conn, "lockeduntil", "TEXT NULL", ct);
             await AddColumnIfMissingAsync(conn, "locktoken",   "TEXT NULL", ct);
+            await AddColumnIfMissingAsync(conn, "lasterror",   "TEXT NULL", ct);
+
+            // Existing dead-letters are marked as already notified so the upgrade does not
+            // send faults for them.
+            if (await AddColumnIfMissingAsync(conn, "faultdispatchedat", "TEXT NULL", ct))
+                await Exec(conn, "UPDATE workqueue SET faultdispatchedat = failedat WHERE failedat IS NOT NULL", ct);
+
+            await Exec(conn, """
+                CREATE INDEX IF NOT EXISTS IX_workqueue_channel_pendingfault
+                ON workqueue (channel, failedat)
+                WHERE failedat IS NOT NULL AND faultdispatchedat IS NULL
+                """, ct);
 
             _logger.LogInformation("SQLite workqueue migrations completed.");
         }
@@ -88,14 +102,17 @@ public class SqliteMigrationHostedService : IHostedService
         }
     }
 
-    private static async Task AddColumnIfMissingAsync(
+    // Returns true when the column was added.
+    private static async Task<bool> AddColumnIfMissingAsync(
         SqliteConnection conn, string column, string definition, CancellationToken ct)
     {
         var check = conn.CreateCommand();
         check.CommandText = $"SELECT COUNT(*) FROM pragma_table_info('workqueue') WHERE name = '{column}'";
         var count = Convert.ToInt32(await check.ExecuteScalarAsync(ct));
-        if (count == 0)
-            await Exec(conn, $"ALTER TABLE workqueue ADD COLUMN {column} {definition}", ct);
+        if (count != 0) return false;
+
+        await Exec(conn, $"ALTER TABLE workqueue ADD COLUMN {column} {definition}", ct);
+        return true;
     }
 
     private static async Task Exec(SqliteConnection conn, string sql, CancellationToken ct)

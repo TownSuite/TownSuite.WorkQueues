@@ -11,6 +11,8 @@ BEGIN
         [failedat]         DATETIME         NULL,
         [retrycount]       INT              NOT NULL CONSTRAINT [DF_workqueue_retrycount] DEFAULT (0),
         [scheduledfor]     DATETIME         NULL,
+        [faultdispatchedat] DATETIME        NULL,
+        [lasterror]        NVARCHAR(MAX)    NULL,
         CONSTRAINT [PK_workqueue] PRIMARY KEY CLUSTERED ([id] ASC)
     )
 END
@@ -54,6 +56,26 @@ BEGIN
             CONSTRAINT [DF_workqueue_messageid_add] DEFAULT (NEWID()) WITH VALUES
 END
 GO
+-- Add lasterror column if upgrading from a schema that pre-dates it.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[workqueue]') AND name = N'lasterror'
+)
+BEGIN
+    ALTER TABLE [dbo].[workqueue] ADD [lasterror] NVARCHAR(MAX) NULL
+END
+GO
+-- Add faultdispatchedat column if upgrading from a schema that pre-dates it. Existing
+-- dead-letters are marked as already notified so the upgrade does not send faults for them.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[workqueue]') AND name = N'faultdispatchedat'
+)
+BEGIN
+    ALTER TABLE [dbo].[workqueue] ADD [faultdispatchedat] DATETIME NULL
+    EXEC(N'UPDATE [dbo].[workqueue] SET [faultdispatchedat] = [failedat] WHERE [failedat] IS NOT NULL')
+END
+GO
 -- Widen channel column if upgrading from nvarchar(50).
 IF EXISTS (
     SELECT 1 FROM sys.columns
@@ -87,4 +109,16 @@ BEGIN
     CREATE NONCLUSTERED INDEX [IX_workqueue_channel_deadlettered]
     ON [dbo].[workqueue] ([channel] ASC, [messageid] ASC)
     WHERE ([failedat] IS NOT NULL)
+END
+GO
+-- Filtered index over dead-letters whose fault has not been delivered, for fault redelivery.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_workqueue_channel_pendingfault'
+      AND object_id = OBJECT_ID(N'[dbo].[workqueue]')
+)
+BEGIN
+    CREATE NONCLUSTERED INDEX [IX_workqueue_channel_pendingfault]
+    ON [dbo].[workqueue] ([channel] ASC, [failedat] ASC)
+    WHERE ([failedat] IS NOT NULL AND [faultdispatchedat] IS NULL)
 END

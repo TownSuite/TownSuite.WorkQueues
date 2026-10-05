@@ -19,8 +19,8 @@ public class SqlServerMessageBus : IMessageBus
     private readonly CancellationTokenSource _cts = new();
     private int _disposed;
     private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Guid, DateTimeOffset, Task>>> _handlers = new();
-    private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Task>>> _faultHandlers = new();
-    private readonly ConcurrentDictionary<Type, Func<string, Exception, int, Guid, bool, Task>> _faultDispatchers = new();
+    private readonly FaultRegistry _faults = new();
+    private readonly IntervalGate _faultGate;
     private readonly Task[] _pollingTasks;
     private const string Transport = "sqlserver";
     private readonly ILogger _logger;
@@ -32,6 +32,7 @@ public class SqlServerMessageBus : IMessageBus
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger  = logger  ?? throw new ArgumentNullException(nameof(logger));
         _serviceProvider = serviceProvider;
+        _faultGate = IntervalGate.ForFaultRedelivery(options);
         // Yield to the caller so Subscribe() calls made immediately after construction
         // are registered before the first poll cycle runs.
         _pollingTasks = Enumerable.Range(0, Math.Max(1, options.MaxConcurrency))
@@ -52,7 +53,6 @@ public class SqlServerMessageBus : IMessageBus
             if (obj is T message)
                 await consumer.Consume(new SimpleConsumeContext<T>(message, _cts.Token, messageId, sentTime));
         });
-        EnsureFaultDispatcher<T>();
     }
 
     /// <summary>
@@ -80,46 +80,10 @@ public class SqlServerMessageBus : IMessageBus
                 await consumer.Consume(new SimpleConsumeContext<TMessage>(message, _cts.Token, messageId, sentTime));
             }
         });
-        EnsureFaultDispatcher<TMessage>();
     }
 
     /// <inheritdoc />
-    public void SubscribeFault<T>(IConsumer<Fault<T>> consumer)
-    {
-        var handlers = _faultHandlers.GetOrAdd(typeof(T),
-            _ => new ConcurrentDictionary<object, Func<object, Task>>());
-        handlers.TryAdd(consumer, async obj =>
-        {
-            if (obj is Fault<T> fault)
-                await consumer.Consume(new SimpleConsumeContext<Fault<T>>(fault, _cts.Token));
-        });
-    }
-
-    private void EnsureFaultDispatcher<T>()
-    {
-        _faultDispatchers.TryAdd(typeof(T), async (payload, ex, attemptCount, messageId, nonRetryable) =>
-        {
-            if (!_faultHandlers.TryGetValue(typeof(T), out var handlers) || handlers.IsEmpty)
-                return;
-
-            var original = LegacyJsonDeserializer.Deserialize(payload, typeof(T));
-            if (original is not T typedOriginal) return;
-
-            var fault = new Fault<T>
-            {
-                OriginalMessage  = typedOriginal,
-                ExceptionType    = ex.GetType().FullName ?? ex.GetType().Name,
-                ExceptionMessage = ex.Message,
-                StackTrace       = ex.StackTrace,
-                FaultedAt        = DateTimeOffset.UtcNow,
-                AttemptCount     = attemptCount,
-                MessageId        = messageId,
-                NonRetryable     = nonRetryable
-            };
-
-            await Task.WhenAll(handlers.Values.Select(h => h(fault)));
-        });
-    }
+    public void SubscribeFault<T>(IConsumer<Fault<T>> consumer) => _faults.Add(consumer);
 
     /// <inheritdoc />
     public async Task Publish<T>(T message, CancellationToken cancellationToken = default)
@@ -203,7 +167,7 @@ public class SqlServerMessageBus : IMessageBus
 
         var sql = $"""
             UPDATE [{_options.Schema}].[workqueue]
-            SET [failedat] = NULL, [retrycount] = 0, [scheduledfor] = NULL
+            SET [failedat] = NULL, [retrycount] = 0, [scheduledfor] = NULL, [faultdispatchedat] = NULL
             WHERE [channel] = @channel AND [failedat] IS NOT NULL
             """;
         await using var cmd = new SqlCommand(sql, conn);
@@ -219,7 +183,7 @@ public class SqlServerMessageBus : IMessageBus
 
         var sql = $"""
             UPDATE [{_options.Schema}].[workqueue]
-            SET [failedat] = NULL, [retrycount] = 0, [scheduledfor] = NULL
+            SET [failedat] = NULL, [retrycount] = 0, [scheduledfor] = NULL, [faultdispatchedat] = NULL
             WHERE [channel] = @channel AND [messageid] = @messageid AND [failedat] IS NOT NULL
             """;
         await using var cmd = new SqlCommand(sql, conn);
@@ -241,6 +205,8 @@ public class SqlServerMessageBus : IMessageBus
                  WHERE [channel] = @channel AND [timeprocessedutc] IS NULL AND [failedat] IS NULL),
                 (SELECT COUNT_BIG(*) FROM [{_options.Schema}].[workqueue]
                  WHERE [channel] = @channel AND [failedat] IS NOT NULL),
+                (SELECT COUNT_BIG(*) FROM [{_options.Schema}].[workqueue]
+                 WHERE [channel] = @channel AND [failedat] IS NOT NULL AND [faultdispatchedat] IS NULL),
                 (SELECT MIN(COALESCE([scheduledfor], [timecreatedutc])) FROM [{_options.Schema}].[workqueue]
                  WHERE [channel] = @channel AND [timeprocessedutc] IS NULL AND [failedat] IS NULL
                    AND ([scheduledfor] IS NULL OR [scheduledfor] <= GETUTCDATE())),
@@ -256,9 +222,45 @@ public class SqlServerMessageBus : IMessageBus
             Channel           = channel,
             PendingCount      = reader.GetInt64(0),
             DeadLetteredCount = reader.GetInt64(1),
-            OldestReadySince  = reader.IsDBNull(2) ? null : new DateTimeOffset(reader.GetDateTime(2), TimeSpan.Zero),
-            CapturedAt        = new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero)
+            PendingFaultCount = reader.GetInt64(2),
+            OldestReadySince  = reader.IsDBNull(3) ? null : new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
+            CapturedAt        = new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero)
         };
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<DeadLetteredMessage<T>>> GetDeadLettered<T>(int skip = 0, int take = 100,
+        CancellationToken cancellationToken = default)
+    {
+        await using var conn = new SqlConnection(_options.ConnectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        var sql = $"""
+            SELECT [messageid], [payload], [timecreatedutc], [failedat], [retrycount], [lasterror], [faultdispatchedat]
+            FROM [{_options.Schema}].[workqueue]
+            WHERE [channel] = @channel AND [failedat] IS NOT NULL
+            ORDER BY [failedat] DESC, [id] DESC
+            OFFSET @skip ROWS FETCH NEXT @take ROWS ONLY
+            """;
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@channel", ChannelName<T>());
+        cmd.Parameters.AddWithValue("@skip", Math.Max(0, skip));
+        cmd.Parameters.AddWithValue("@take", Math.Max(0, take));
+
+        var result = new List<DeadLetteredMessage<T>>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(FaultRegistry.ToDeadLettered<T>(
+                reader.GetGuid(0),
+                reader.GetString(1),
+                new DateTimeOffset(reader.GetDateTime(2), TimeSpan.Zero),
+                new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
+                reader.GetInt32(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                !reader.IsDBNull(6)));
+        }
+        return result;
     }
 
     private async Task ProcessMessagesAsync()
@@ -267,7 +269,8 @@ public class SqlServerMessageBus : IMessageBus
         {
             try
             {
-                int processed = await ClaimMessagesAsync(_options.MaxBatchSize);
+                int processed = await ClaimMessagesAsync(_options.MaxBatchSize)
+                              + (_faultGate.TryEnter() ? await RedeliverFaultsAsync(_options.MaxBatchSize) : 0);
                 if (processed == 0)
                     await WaitAsync();
             }
@@ -346,7 +349,7 @@ public class SqlServerMessageBus : IMessageBus
 
         // Fault consumers run only after the claim transaction commits, so a failed commit
         // never reports a dead-letter that did not happen.
-        var faults = new List<(MessageDto Message, Exception Exception, bool NonRetryable)>();
+        var faults = new List<FaultInfo>();
 
         foreach (var msg in messages)
         {
@@ -380,19 +383,25 @@ public class SqlServerMessageBus : IMessageBus
                 bool willDeadLetter = nonRetryable || attempt >= _options.MaxRetries;
                 var retryDelay = _options.GetRetryDelay(attempt);
 
-                DateTime? scheduledFor = !willDeadLetter && retryDelay > TimeSpan.Zero
-                    ? DateTime.UtcNow.Add(retryDelay)
-                    : (DateTime?)null;
+                // A dead-lettered row reuses scheduledfor as the time its fault may be redelivered,
+                // in case the fault consumer below does not run or does not finish.
+                DateTime? scheduledFor = willDeadLetter
+                    ? DateTime.UtcNow.Add(_options.FaultRedeliveryDelay)
+                    : retryDelay > TimeSpan.Zero ? DateTime.UtcNow.Add(retryDelay) : null;
+                var error = StoredError.From(lastException, nonRetryable);
 
                 await using var retry = new SqlCommand($"""
                     UPDATE [{_options.Schema}].[workqueue]
-                    SET [retrycount]   = [retrycount] + 1,
-                        [failedat]     = CASE WHEN @deadLetter = 1 THEN GETUTCDATE() ELSE NULL END,
-                        [scheduledfor] = @scheduledFor
+                    SET [retrycount]        = [retrycount] + 1,
+                        [failedat]          = CASE WHEN @deadLetter = 1 THEN GETUTCDATE() ELSE NULL END,
+                        [faultdispatchedat] = NULL,
+                        [scheduledfor]      = @scheduledFor,
+                        [lasterror]         = @lastError
                     WHERE [id] = @id
                     """, conn, tran);
                 retry.Parameters.AddWithValue("@id", msg.Id);
                 retry.Parameters.AddWithValue("@deadLetter", willDeadLetter);
+                retry.Parameters.AddWithValue("@lastError", error.ToJson());
                 retry.Parameters.Add(new SqlParameter("@scheduledFor", System.Data.SqlDbType.DateTime)
                 {
                     Value = scheduledFor.HasValue ? (object)scheduledFor.Value : DBNull.Value
@@ -402,7 +411,8 @@ public class SqlServerMessageBus : IMessageBus
                 if (willDeadLetter)
                 {
                     WorkQueueMetrics.RecordDeadLettered(Transport, msg.Channel, stopwatch.Elapsed);
-                    faults.Add((msg, lastException, nonRetryable));
+                    faults.Add(new FaultInfo(msg.Channel, msg.Payload, msg.MessageId, attempt,
+                        DateTimeOffset.UtcNow, error, IsRedelivery: false));
                 }
                 else
                 {
@@ -413,22 +423,94 @@ public class SqlServerMessageBus : IMessageBus
 
         await tran.CommitAsync();
 
-        foreach (var (msg, exception, nonRetryable) in faults)
-            await DispatchFaultAsync(msg, exception, nonRetryable);
+        foreach (var fault in faults)
+            await DeliverFaultAsync(fault);
 
         return messages.Count;
     }
 
-    private async Task DispatchFaultAsync(MessageDto msg, Exception exception, bool nonRetryable)
+    // Claims dead-lettered rows whose fault was never delivered and whose redelivery time has
+    // passed. The claim pushes scheduledfor forward by FaultRedeliveryDelay and commits at once,
+    // so no lock is held while fault consumers run; the pushed-forward time acts as a lease.
+    private async Task<int> RedeliverFaultsAsync(int maxFaults)
     {
-        var msgType = _handlers.Keys.FirstOrDefault(t => t.FullName == msg.Channel);
-        if (msgType == null || !_faultDispatchers.TryGetValue(msgType, out var dispatcher)) return;
+        var channelNames = _faults.Channels;
+        if (channelNames.Length == 0) return 0;
 
-        try { await dispatcher(msg.Payload, exception, msg.RetryCount + 1, msg.MessageId, nonRetryable); }
+        var paramNames = Enumerable.Range(0, channelNames.Length).Select(i => $"@ch{i}").ToArray();
+        var inClause = string.Join(", ", paramNames);
+
+        var sql = $"""
+            WITH due AS (
+                SELECT TOP (@maxFaults) *
+                FROM [{_options.Schema}].[workqueue] WITH (UPDLOCK, ROWLOCK, READPAST)
+                WHERE [failedat] IS NOT NULL
+                  AND [faultdispatchedat] IS NULL
+                  AND ([scheduledfor] IS NULL OR [scheduledfor] <= GETUTCDATE())
+                  AND [channel] IN ({inClause})
+                ORDER BY [failedat]
+            )
+            UPDATE due
+            SET [scheduledfor] = DATEADD(millisecond, @leaseMs, GETUTCDATE())
+            OUTPUT inserted.[channel], inserted.[payload], inserted.[messageid],
+                   inserted.[retrycount], inserted.[failedat], inserted.[lasterror]
+            """;
+
+        var due = new List<FaultInfo>();
+        await using (var conn = new SqlConnection(_options.ConnectionString))
+        {
+            await conn.OpenAsync(_cts.Token);
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@maxFaults", maxFaults);
+            cmd.Parameters.AddWithValue("@leaseMs", (int)Math.Min(int.MaxValue, _options.FaultRedeliveryDelay.TotalMilliseconds));
+            for (int i = 0; i < channelNames.Length; i++)
+                cmd.Parameters.AddWithValue(paramNames[i], channelNames[i]);
+
+            await using var reader = await cmd.ExecuteReaderAsync(_cts.Token);
+            while (await reader.ReadAsync(_cts.Token))
+            {
+                due.Add(new FaultInfo(
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetGuid(2),
+                    reader.GetInt32(3),
+                    new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero),
+                    StoredError.Parse(reader.IsDBNull(5) ? null : reader.GetString(5)),
+                    IsRedelivery: true));
+            }
+        }
+
+        foreach (var fault in due)
+            await DeliverFaultAsync(fault);
+
+        return due.Count;
+    }
+
+    // Delivers a fault and records it as delivered. A fault consumer that throws leaves the row
+    // pending; it is redelivered once scheduledfor passes.
+    private async Task DeliverFaultAsync(FaultInfo fault)
+    {
+        bool delivered;
+        try { delivered = await _faults.DispatchAsync(fault, _cts.Token); }
         catch (Exception fex)
         {
-            _logger.LogError(fex, "Fault consumer threw for dead-lettered message {Id}", msg.Id);
+            _logger.LogError(fex, "Fault consumer threw for dead-lettered message {MessageId} on channel {Channel}; it will be redelivered",
+                fault.MessageId, fault.Channel);
+            return;
         }
+
+        if (!delivered) return;
+
+        await using var conn = new SqlConnection(_options.ConnectionString);
+        await conn.OpenAsync();
+        await using var cmd = new SqlCommand($"""
+            UPDATE [{_options.Schema}].[workqueue]
+            SET [faultdispatchedat] = GETUTCDATE()
+            WHERE [channel] = @channel AND [messageid] = @messageid AND [failedat] IS NOT NULL
+            """, conn);
+        cmd.Parameters.AddWithValue("@channel", fault.Channel);
+        cmd.Parameters.AddWithValue("@messageid", fault.MessageId);
+        await cmd.ExecuteNonQueryAsync();
     }
 
     private async Task DispatchMessageAsync(MessageDto msg)

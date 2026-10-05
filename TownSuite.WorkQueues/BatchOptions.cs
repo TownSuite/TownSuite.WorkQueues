@@ -69,6 +69,14 @@
         public Func<Exception, bool>? IsRetryable { get; set; }
 
         /// <summary>
+        /// How long to wait before delivering a <see cref="Fault{T}"/> again when the fault
+        /// consumer threw or the process stopped before it finished. Defaults to one minute.
+        /// It is also how long a bus holds a fault it is redelivering before another bus may
+        /// take it, so keep it longer than the slowest fault consumer.
+        /// </summary>
+        public TimeSpan FaultRedeliveryDelay { get; set; } = TimeSpan.FromMinutes(1);
+
+        /// <summary>
         /// Returns the delay to apply before the given retry attempt.
         /// </summary>
         /// <param name="attempt">The 1-based number of the failed attempt being retried.</param>

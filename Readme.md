@@ -102,6 +102,8 @@ cycle (within `MaxWaitTime`, default 5 s).
 - [Redis Backend](#redis-backend)
 - [Dead-Letter Queue & Retries](#dead-letter-queue--retries)
   - [Programmatic replay via ReplayDeadLettered\<T\>](#programmatic-replay-via-replaydeadletteredt)
+  - [Listing dead-lettered messages](#listing-dead-lettered-messages)
+  - [Fault delivery guarantees](#fault-delivery-guarantees)
   - [Retry backoff](#retry-backoff)
   - [Non-retryable exceptions](#non-retryable-exceptions)
   - [Checking bus health with IsPolling](#checking-bus-health-with-ispolling)
@@ -566,6 +568,39 @@ bool replayed = await bus.ReplayDeadLettered<PaymentConfirmed>(fault.MessageId);
 
 It returns `false` when no dead-lettered message with that id exists on the channel.
 
+### Listing dead-lettered messages
+
+`GetDeadLettered<T>` lists dead-letters newest first, with the last error and whether the fault has
+been delivered. Use it for an admin screen that shows what failed before someone replays it:
+
+```csharp
+IReadOnlyList<DeadLetteredMessage<PaymentConfirmed>> page =
+    await bus.GetDeadLettered<PaymentConfirmed>(skip: 0, take: 50);
+
+foreach (var dead in page)
+    Console.WriteLine($"{dead.MessageId} {dead.FailedAt:u} {dead.ExceptionType}: {dead.ExceptionMessage}");
+```
+
+`Message` is `null` (default) if the stored payload no longer deserialises to `T`; `Payload` always
+holds the raw JSON. Error details are recorded from this version on; older dead-letters list without them.
+
+### Fault delivery guarantees
+
+`Fault<T>` delivery is **at-least-once**, like message delivery:
+
+1. The dead-letter is committed first, together with the error and a fault redelivery time.
+2. The bus then delivers the fault to its `Fault<T>` consumers and records it as delivered.
+3. If a fault consumer throws, or the process stops before step 2 finishes, the fault stays pending.
+   After `FaultRedeliveryDelay` (default one minute) any bus on the same store with a fault consumer for
+   `T` delivers it again, with `Fault<T>.IsRedelivery = true`.
+
+So fault consumers must be idempotent. A bus that only calls `SubscribeFault<T>` (no `Subscribe<T>`)
+still delivers faults for `T`.
+
+Faults for messages dead-lettered while **no** bus had a fault consumer for `T` stay pending, and are
+delivered once one subscribes. `QueueStatistics.PendingFaultCount` shows how many are waiting; a value
+that stays above zero means a fault consumer keeps failing or none is subscribed.
+
 ### Retry backoff
 
 `RetryDelay` holds a failed message back before its next attempt. Set `RetryBackoffMultiplier` to grow
@@ -619,8 +654,7 @@ subscribed to, so messages published to a channel with no subscribed bus stay pe
 ### When fault consumers run
 
 `Fault<T>` consumers run after the dead-letter state is committed, so a fault consumer that reads the
-row (or replays it) sees `failedat` set. A fault consumer that throws is logged and does not affect the
-message.
+row (or replays it) sees `failedat` set. See [Fault delivery guarantees](#fault-delivery-guarantees).
 
 ---
 
@@ -705,6 +739,7 @@ Backlog size and age need a query, so they are read on demand:
 QueueStatistics stats = await bus.GetQueueStatistics<CartAddItemRequested>();
 // stats.PendingCount       — not yet processed (includes scheduled and waiting-for-retry)
 // stats.DeadLetteredCount  — dead-lettered and held for replay
+// stats.PendingFaultCount  — dead-letters whose Fault<T> has not been delivered yet
 // stats.OldestReadyAge     — how long the oldest deliverable message has waited (null if none)
 ```
 
@@ -729,6 +764,7 @@ towards the age until they become due. Expose the values as observable gauges or
 | `MaxRetryDelay` | `null` (1 day) | Cap on the computed retry delay |
 | `MaxConcurrency` | `1` | Polling loops run in parallel by one bus |
 | `IsRetryable` | `null` (retry all) | Return `false` to dead-letter an exception immediately |
+| `FaultRedeliveryDelay` | `1 min` | Delay before an undelivered `Fault<T>` is delivered again; also the lease a bus holds while redelivering |
 
 ### `SqlTransportOptions` (extends `BatchOptions`)
 

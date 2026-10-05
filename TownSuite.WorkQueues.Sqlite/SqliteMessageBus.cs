@@ -39,8 +39,8 @@ public class SqliteMessageBus : IMessageBus
     private readonly CancellationTokenSource _cts = new();
     private int _disposed;
     private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Guid, DateTimeOffset, Task>>> _handlers = new();
-    private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Task>>> _faultHandlers = new();
-    private readonly ConcurrentDictionary<Type, Func<string, Exception, int, Guid, bool, Task>> _faultDispatchers = new();
+    private readonly FaultRegistry _faults = new();
+    private readonly IntervalGate _faultGate;
     private readonly Task[] _pollingTasks;
     private const string Transport = "sqlite";
     private readonly ILogger _logger;
@@ -52,6 +52,7 @@ public class SqliteMessageBus : IMessageBus
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger  = logger  ?? throw new ArgumentNullException(nameof(logger));
         _serviceProvider = serviceProvider;
+        _faultGate = IntervalGate.ForFaultRedelivery(options);
         // Yield to the caller so Subscribe() calls made immediately after construction
         // are registered before the first poll cycle runs.
         _pollingTasks = Enumerable.Range(0, Math.Max(1, options.MaxConcurrency))
@@ -72,7 +73,6 @@ public class SqliteMessageBus : IMessageBus
             if (obj is T message)
                 await consumer.Consume(new SimpleConsumeContext<T>(message, _cts.Token, messageId, sentTime));
         });
-        EnsureFaultDispatcher<T>();
     }
 
     /// <summary>
@@ -99,46 +99,10 @@ public class SqliteMessageBus : IMessageBus
                 await consumer.Consume(new SimpleConsumeContext<TMessage>(message, _cts.Token, messageId, sentTime));
             }
         });
-        EnsureFaultDispatcher<TMessage>();
     }
 
     /// <inheritdoc />
-    public void SubscribeFault<T>(IConsumer<Fault<T>> consumer)
-    {
-        var handlers = _faultHandlers.GetOrAdd(typeof(T),
-            _ => new ConcurrentDictionary<object, Func<object, Task>>());
-        handlers.TryAdd(consumer, async obj =>
-        {
-            if (obj is Fault<T> fault)
-                await consumer.Consume(new SimpleConsumeContext<Fault<T>>(fault, _cts.Token));
-        });
-    }
-
-    private void EnsureFaultDispatcher<T>()
-    {
-        _faultDispatchers.TryAdd(typeof(T), async (payload, ex, attemptCount, messageId, nonRetryable) =>
-        {
-            if (!_faultHandlers.TryGetValue(typeof(T), out var handlers) || handlers.IsEmpty)
-                return;
-
-            var original = LegacyJsonDeserializer.Deserialize(payload, typeof(T));
-            if (original is not T typedOriginal) return;
-
-            var fault = new Fault<T>
-            {
-                OriginalMessage  = typedOriginal,
-                ExceptionType    = ex.GetType().FullName ?? ex.GetType().Name,
-                ExceptionMessage = ex.Message,
-                StackTrace       = ex.StackTrace,
-                FaultedAt        = DateTimeOffset.UtcNow,
-                AttemptCount     = attemptCount,
-                MessageId        = messageId,
-                NonRetryable     = nonRetryable
-            };
-
-            await Task.WhenAll(handlers.Values.Select(h => h(fault)));
-        });
-    }
+    public void SubscribeFault<T>(IConsumer<Fault<T>> consumer) => _faults.Add(consumer);
 
     /// <inheritdoc />
     public async Task Publish<T>(T message, CancellationToken cancellationToken = default)
@@ -213,7 +177,7 @@ public class SqliteMessageBus : IMessageBus
         await using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE workqueue
-            SET failedat = NULL, retrycount = 0, scheduledfor = NULL,
+            SET failedat = NULL, retrycount = 0, scheduledfor = NULL, faultdispatchedat = NULL,
                 lockeduntil = NULL, locktoken = NULL
             WHERE channel = @channel AND failedat IS NOT NULL
             """;
@@ -228,7 +192,7 @@ public class SqliteMessageBus : IMessageBus
         await using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE workqueue
-            SET failedat = NULL, retrycount = 0, scheduledfor = NULL,
+            SET failedat = NULL, retrycount = 0, scheduledfor = NULL, faultdispatchedat = NULL,
                 lockeduntil = NULL, locktoken = NULL
             WHERE channel = @channel AND messageid = @messageid AND failedat IS NOT NULL
             """;
@@ -251,6 +215,8 @@ public class SqliteMessageBus : IMessageBus
                  WHERE channel = @channel AND timeprocessedutc IS NULL AND failedat IS NULL),
                 (SELECT COUNT(*) FROM workqueue
                  WHERE channel = @channel AND failedat IS NOT NULL),
+                (SELECT COUNT(*) FROM workqueue
+                 WHERE channel = @channel AND failedat IS NOT NULL AND faultdispatchedat IS NULL),
                 (SELECT MIN(COALESCE(scheduledfor, timecreatedutc)) FROM workqueue
                  WHERE channel = @channel AND timeprocessedutc IS NULL AND failedat IS NULL
                    AND (scheduledfor IS NULL OR scheduledfor <= @now))
@@ -265,11 +231,43 @@ public class SqliteMessageBus : IMessageBus
             Channel           = channel,
             PendingCount      = reader.GetInt64(0),
             DeadLetteredCount = reader.GetInt64(1),
-            OldestReadySince  = reader.IsDBNull(2)
-                ? null
-                : DateTimeOffset.Parse(reader.GetString(2), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal),
+            PendingFaultCount = reader.GetInt64(2),
+            OldestReadySince  = reader.IsDBNull(3) ? null : ParseSqliteDateTime(reader.GetString(3)),
             CapturedAt        = new DateTimeOffset(now, TimeSpan.Zero)
         };
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<DeadLetteredMessage<T>>> GetDeadLettered<T>(int skip = 0, int take = 100,
+        CancellationToken cancellationToken = default)
+    {
+        await using var conn = await OpenConnectionAsync(cancellationToken);
+        await using var cmd  = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT messageid, payload, timecreatedutc, failedat, retrycount, lasterror, faultdispatchedat
+            FROM workqueue
+            WHERE channel = @channel AND failedat IS NOT NULL
+            ORDER BY failedat DESC, id DESC
+            LIMIT @take OFFSET @skip
+            """;
+        cmd.Parameters.AddWithValue("@channel", ChannelName<T>());
+        cmd.Parameters.AddWithValue("@skip",    Math.Max(0, skip));
+        cmd.Parameters.AddWithValue("@take",    Math.Max(0, take));
+
+        var result = new List<DeadLetteredMessage<T>>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(FaultRegistry.ToDeadLettered<T>(
+                Guid.Parse(reader.GetString(0)),
+                reader.GetString(1),
+                ParseSqliteDateTime(reader.GetString(2)),
+                ParseSqliteDateTime(reader.GetString(3)),
+                reader.GetInt32(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                !reader.IsDBNull(6)));
+        }
+        return result;
     }
 
     private async Task ProcessMessagesAsync()
@@ -278,7 +276,8 @@ public class SqliteMessageBus : IMessageBus
         {
             try
             {
-                int processed = await ClaimMessagesAsync(_options.MaxBatchSize);
+                int processed = await ClaimMessagesAsync(_options.MaxBatchSize)
+                              + (_faultGate.TryEnter() ? await RedeliverFaultsAsync(_options.MaxBatchSize) : 0);
                 if (processed == 0)
                     await WaitAsync();
             }
@@ -407,9 +406,13 @@ public class SqliteMessageBus : IMessageBus
                 bool willDeadLetter = nonRetryable || attempt >= _options.MaxRetries;
                 var retryDelay = _options.GetRetryDelay(attempt);
 
-                object scheduledFor = !willDeadLetter && retryDelay > TimeSpan.Zero
-                    ? ToSqliteDateTime(DateTime.UtcNow.Add(retryDelay))
+                // A dead-lettered row reuses scheduledfor as the time its fault may be redelivered,
+                // in case the fault consumer below does not run or does not finish.
+                var holdFor = willDeadLetter ? _options.FaultRedeliveryDelay : retryDelay;
+                object scheduledFor = holdFor > TimeSpan.Zero
+                    ? ToSqliteDateTime(DateTime.UtcNow.Add(holdFor))
                     : DBNull.Value;
+                var error = StoredError.From(lastException, nonRetryable);
                 object failedAt = willDeadLetter
                     ? ToSqliteDateTime(DateTime.UtcNow)
                     : DBNull.Value;
@@ -417,14 +420,17 @@ public class SqliteMessageBus : IMessageBus
                 await using var retryCmd = conn.CreateCommand();
                 retryCmd.CommandText = """
                     UPDATE workqueue
-                    SET retrycount   = retrycount + 1,
-                        failedat     = @failedat,
-                        scheduledfor = @scheduledfor,
-                        lockeduntil  = NULL,
-                        locktoken    = NULL
+                    SET retrycount        = retrycount + 1,
+                        failedat          = @failedat,
+                        faultdispatchedat = NULL,
+                        scheduledfor      = @scheduledfor,
+                        lasterror         = @lasterror,
+                        lockeduntil       = NULL,
+                        locktoken         = NULL
                     WHERE id = @id
                     """;
                 retryCmd.Parameters.AddWithValue("@id",          msg.Id);
+                retryCmd.Parameters.AddWithValue("@lasterror",   error.ToJson());
                 retryCmd.Parameters.AddWithValue("@failedat",    failedAt);
                 retryCmd.Parameters.AddWithValue("@scheduledfor", scheduledFor);
                 await retryCmd.ExecuteNonQueryAsync(_cts.Token);
@@ -435,15 +441,8 @@ public class SqliteMessageBus : IMessageBus
 
                     // The UPDATE above auto-commits, so the dead-letter is durable before the
                     // fault consumer runs.
-                    var msgType = _handlers.Keys.FirstOrDefault(t => t.FullName == msg.Channel);
-                    if (msgType != null && _faultDispatchers.TryGetValue(msgType, out var dispatcher))
-                    {
-                        try { await dispatcher(msg.Payload, lastException, attempt, msg.MessageId, nonRetryable); }
-                        catch (Exception fex)
-                        {
-                            _logger.LogError(fex, "Fault consumer threw for dead-lettered message {Id}", msg.Id);
-                        }
-                    }
+                    await DeliverFaultAsync(new FaultInfo(msg.Channel, msg.Payload, msg.MessageId, attempt,
+                        DateTimeOffset.UtcNow, error, IsRedelivery: false));
                 }
                 else
                 {
@@ -453,6 +452,108 @@ public class SqliteMessageBus : IMessageBus
         }
 
         return messages.Count;
+    }
+
+    // Claims dead-lettered rows whose fault was never delivered and whose redelivery time has
+    // passed. The claim pushes scheduledfor forward by FaultRedeliveryDelay, which acts as a
+    // lease: other processes skip the row until it passes.
+    private async Task<int> RedeliverFaultsAsync(int maxFaults)
+    {
+        var channelNames = _faults.Channels;
+        if (channelNames.Length == 0) return 0;
+
+        var leaseToken = Guid.NewGuid().ToString();
+        var now        = DateTime.UtcNow;
+        var paramNames = Enumerable.Range(0, channelNames.Length).Select(i => $"@ch{i}").ToArray();
+        var inClause   = string.Join(", ", paramNames);
+
+        var due = new List<FaultInfo>();
+        await using (var conn = await OpenConnectionAsync(_cts.Token))
+        {
+            await using (var claimCmd = conn.CreateCommand())
+            {
+                claimCmd.CommandText = $"""
+                    UPDATE workqueue
+                    SET scheduledfor = @leaseUntil, locktoken = @locktoken
+                    WHERE id IN (
+                        SELECT id FROM workqueue
+                        WHERE failedat IS NOT NULL
+                          AND faultdispatchedat IS NULL
+                          AND (scheduledfor IS NULL OR scheduledfor <= @now)
+                          AND channel IN ({inClause})
+                        ORDER BY failedat
+                        LIMIT @maxFaults
+                    )
+                    """;
+                claimCmd.Parameters.AddWithValue("@leaseUntil", ToSqliteDateTime(now.Add(_options.FaultRedeliveryDelay)));
+                claimCmd.Parameters.AddWithValue("@locktoken",  leaseToken);
+                claimCmd.Parameters.AddWithValue("@now",        ToSqliteDateTime(now));
+                claimCmd.Parameters.AddWithValue("@maxFaults",  maxFaults);
+                for (int i = 0; i < channelNames.Length; i++)
+                    claimCmd.Parameters.AddWithValue(paramNames[i], channelNames[i]);
+                if (await claimCmd.ExecuteNonQueryAsync(_cts.Token) == 0) return 0;
+            }
+
+            await using (var fetchCmd = conn.CreateCommand())
+            {
+                fetchCmd.CommandText = """
+                    SELECT channel, payload, messageid, retrycount, failedat, lasterror
+                    FROM workqueue WHERE locktoken = @locktoken
+                    """;
+                fetchCmd.Parameters.AddWithValue("@locktoken", leaseToken);
+                await using var reader = await fetchCmd.ExecuteReaderAsync(_cts.Token);
+                while (await reader.ReadAsync(_cts.Token))
+                {
+                    due.Add(new FaultInfo(
+                        reader.GetString(0),
+                        reader.GetString(1),
+                        Guid.Parse(reader.GetString(2)),
+                        reader.GetInt32(3),
+                        ParseSqliteDateTime(reader.GetString(4)),
+                        StoredError.Parse(reader.IsDBNull(5) ? null : reader.GetString(5)),
+                        IsRedelivery: true));
+                }
+            }
+
+            await using (var releaseCmd = conn.CreateCommand())
+            {
+                releaseCmd.CommandText = "UPDATE workqueue SET locktoken = NULL WHERE locktoken = @locktoken";
+                releaseCmd.Parameters.AddWithValue("@locktoken", leaseToken);
+                await releaseCmd.ExecuteNonQueryAsync(_cts.Token);
+            }
+        }
+
+        foreach (var fault in due)
+            await DeliverFaultAsync(fault);
+
+        return due.Count;
+    }
+
+    // Delivers a fault and records it as delivered. A fault consumer that throws leaves the row
+    // pending; it is redelivered once scheduledfor passes.
+    private async Task DeliverFaultAsync(FaultInfo fault)
+    {
+        bool delivered;
+        try { delivered = await _faults.DispatchAsync(fault, _cts.Token); }
+        catch (Exception fex)
+        {
+            _logger.LogError(fex, "Fault consumer threw for dead-lettered message {MessageId} on channel {Channel}; it will be redelivered",
+                fault.MessageId, fault.Channel);
+            return;
+        }
+
+        if (!delivered) return;
+
+        await using var conn = await OpenConnectionAsync();
+        await using var cmd  = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE workqueue SET faultdispatchedat = @now
+            WHERE channel = @channel AND messageid = @messageid AND failedat IS NOT NULL
+            """;
+        cmd.Parameters.AddWithValue("@now",       ToSqliteDateTime(DateTime.UtcNow));
+        cmd.Parameters.AddWithValue("@channel",   fault.Channel);
+        cmd.Parameters.AddWithValue("@messageid", fault.MessageId.ToString());
+        await cmd.ExecuteNonQueryAsync();
     }
 
     private async Task DispatchMessageAsync(MessageDto msg)
@@ -486,6 +587,9 @@ public class SqliteMessageBus : IMessageBus
 
     private static string ToSqliteDateTime(DateTime utc) =>
         utc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ", CultureInfo.InvariantCulture);
+
+    private static DateTimeOffset ParseSqliteDateTime(string value) =>
+        DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal);
 
     public async ValueTask DisposeAsync()
     {

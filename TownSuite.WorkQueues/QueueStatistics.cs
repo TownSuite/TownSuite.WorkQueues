@@ -20,6 +20,13 @@ public sealed class QueueStatistics
     public required long DeadLetteredCount { get; init; }
 
     /// <summary>
+    /// Dead-lettered messages whose <see cref="Fault{T}"/> has not yet been delivered to a fault
+    /// consumer. A count that stays above zero means a fault consumer keeps failing, or no bus
+    /// has subscribed a fault consumer for this channel.
+    /// </summary>
+    public long PendingFaultCount { get; init; }
+
+    /// <summary>
     /// The earliest time a currently deliverable message became ready: its scheduled
     /// delivery time if it has one, otherwise its publish time. <see langword="null"/>
     /// when nothing is waiting to be delivered.

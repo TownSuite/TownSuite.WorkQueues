@@ -6,6 +6,11 @@ namespace TownSuite.WorkQueues;
 /// via <see cref="IMessageBus.SubscribeFault{T}"/> to receive a notification whenever
 /// a message of type <typeparamref name="T"/> is dead-lettered.
 /// </summary>
+/// <remarks>
+/// Fault delivery is at-least-once. The dead-letter is committed first; if the fault consumer
+/// throws, or the process stops before it runs, the fault is delivered again after
+/// <c>BatchOptions.FaultRedeliveryDelay</c>. Fault consumers must be idempotent.
+/// </remarks>
 /// <typeparam name="T">The original message type that failed delivery.</typeparam>
 public sealed class Fault<T>
 {
@@ -14,8 +19,9 @@ public sealed class Fault<T>
 
     /// <summary>
     /// The fully-qualified exception type name from the last failed delivery attempt.
-    /// For Redis transports this will be <c>System.InvalidOperationException</c> because
-    /// the original exception is not retained across retry cycles.
+    /// For Redis transports this will be <c>System.InvalidOperationException</c> when the message
+    /// was dead-lettered by the reclaim cycle, because the original exception is not retained
+    /// across retry cycles.
     /// </summary>
     public required string ExceptionType { get; init; }
 
@@ -24,7 +30,7 @@ public sealed class Fault<T>
 
     /// <summary>
     /// The stack trace from the last failed delivery attempt.
-    /// <see langword="null"/> for Redis transports where the original exception is not retained.
+    /// <see langword="null"/> when the original exception was not retained (Redis reclaim cycle).
     /// </summary>
     public string? StackTrace { get; init; }
 
@@ -46,4 +52,10 @@ public sealed class Fault<T>
     /// <c>MaxRetries</c> because <c>BatchOptions.IsRetryable</c> returned <see langword="false"/>.
     /// </summary>
     public bool NonRetryable { get; init; }
+
+    /// <summary>
+    /// <see langword="true"/> when this fault is being delivered again because an earlier
+    /// delivery attempt threw or did not complete.
+    /// </summary>
+    public bool IsRedelivery { get; init; }
 }
