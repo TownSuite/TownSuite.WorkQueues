@@ -15,6 +15,8 @@ It is written for both humans and AI coding assistants.
 - [Consumers that need scoped services](#consumers-that-need-scoped-services)
 - [Multiple message types](#multiple-message-types)
 - [Publishing from anywhere in the application](#publishing-from-anywhere-in-the-application)
+- [Production settings: concurrency, retries, faults and expiry](#production-settings-concurrency-retries-faults-and-expiry)
+- [Health checks, metrics and purging](#health-checks-metrics-and-purging)
 - [Configuration via appsettings.json](#configuration-via-appsettingsjson)
 - [Deploying as a Windows Service or systemd unit](#deploying-as-a-windows-service-or-systemd-unit)
 - [Checklist for AI coding assistants](#checklist-for-ai-coding-assistants)
@@ -32,8 +34,9 @@ they are constructed. To integrate cleanly with ASP.NET Core's hosted service li
    not in a constructor or at registration time. This guarantees the bus starts *after* the
    migrations hosted service has finished running.
 
-2. **Stop on shutdown** — both buses implement `IDisposable`. Calling `Dispose` cancels the
-   polling loop and waits up to 10 seconds for in-flight dispatches to complete.
+2. **Stop on shutdown** — every bus implements `IAsyncDisposable`. Calling `DisposeAsync` cancels
+   the polling loops and waits up to 10 seconds for in-flight dispatches to complete. (The buses do
+   not implement `IDisposable`, so `(bus as IDisposable)?.Dispose()` silently does nothing.)
 
 The pattern below wraps both concerns in a single `MessageBusHostedService` that every
 example in this guide reuses.
@@ -55,10 +58,9 @@ internal sealed class MessageBusHostedService : IHostedService
         return Task.CompletedTask;
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
-        (_bus as IDisposable)?.Dispose();
-        return Task.CompletedTask;
+        if (_bus != null) await _bus.DisposeAsync();
     }
 }
 ```
@@ -165,10 +167,9 @@ internal sealed class MessageBusHostedService : IHostedService
         return Task.CompletedTask;
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
-        (_bus as IDisposable)?.Dispose();
-        return Task.CompletedTask;
+        if (_bus != null) await _bus.DisposeAsync();
     }
 }
 ```
@@ -493,8 +494,7 @@ public class OrderService
         await _db.SaveChangesAsync();
 
         // Publish after the database write commits.
-        // This is not transactional with the SaveChanges above.
-        // For transactional publishing, see the outbox pattern in MIGRATING.md.
+        // This is not transactional with the SaveChanges above — see below.
         await _bus.Publish(new OrderSubmitted
         {
             OrderId       = order.Id,
@@ -505,9 +505,166 @@ public class OrderService
 }
 ```
 
-> **Transactional publishing:** If you need "publish only if the database write commits",
-> use `IWorkQueue.Enqueue` with the same open connection and transaction (outbox pattern).
-> See [MIGRATING.md — Transactional publishing](MIGRATING.md#transactional-publishing).
+### Publishing inside your own transaction
+
+To publish only if your database write commits, pass the same open connection and transaction to
+`Publish`. The message row commits or rolls back with your own rows:
+
+```csharp
+public async Task PlaceOrderAsync(PlaceOrderRequest req, CancellationToken ct)
+{
+    await using var cn = new NpgsqlConnection(_connectionString);
+    await cn.OpenAsync(ct);
+    await using var tx = await cn.BeginTransactionAsync(ct);
+
+    var orderId = Guid.NewGuid();
+    await cn.ExecuteAsync("INSERT INTO orders (id, email) VALUES (@orderId, @email)",
+        new { orderId, email = req.Email }, tx);
+
+    await _bus.Publish(new OrderSubmitted { OrderId = orderId, CustomerEmail = req.Email }, cn, tx);
+
+    await tx.CommitAsync(ct);
+}
+```
+
+With Entity Framework Core, use `db.Database.GetDbConnection()` and
+`db.Database.CurrentTransaction!.GetDbTransaction()` inside `BeginTransactionAsync`. On Redis, pass an
+`ITransaction` instead: `redisBus.Publish(message, transaction)`. See
+[README — Transactional Publish](Readme.md#transactional-publish-outbox).
+
+---
+
+## Production settings: concurrency, retries, faults and expiry
+
+The examples above use defaults. A production worker usually sets these as well:
+
+```csharp
+services.AddSingleton(new SqlServerTransportOptions
+{
+    ConnectionString = cfg.GetConnectionString("WorkQueue")!,
+
+    // Throughput: several polling loops per bus. With a lease, no transaction or row lock is
+    // held while consumers run, so slow consumers (external APIs) don't block anything.
+    MaxConcurrency = 4,
+    MaxBatchSize   = 10,
+    ClaimLease     = TimeSpan.FromMinutes(2),       // longer than the slowest consumer
+
+    // Retries: 5 attempts, 1s, 2s, 4s, 8s apart (capped at 1 min), transient errors only.
+    MaxRetries             = 5,
+    RetryDelay             = TimeSpan.FromSeconds(1),
+    RetryBackoffMultiplier = 2.0,
+    MaxRetryDelay          = TimeSpan.FromMinutes(1),
+    IsRetryable            = ex => ex is not ValidationException,
+
+    // Faults are delivered at least once; one that throws is redelivered after this delay.
+    FaultRedeliveryDelay = TimeSpan.FromMinutes(1)
+});
+
+services.AddSqlServerMigrationHostedService();
+
+services.AddSingleton<IMessageBus>(sp =>
+{
+    var bus = new SqlServerMessageBus(
+        sp.GetRequiredService<SqlServerTransportOptions>(),
+        sp.GetRequiredService<ILogger<SqlServerMessageBus>>(),
+        sp);
+
+    bus.Subscribe<OrderSubmitted, OrderConsumer>();              // scoped consumer, resolved per message
+    bus.SubscribeFault(sp.GetRequiredService<OrderFaultHandler>()); // runs when a message is dead-lettered
+    return bus;
+});
+
+services.AddScoped<OrderConsumer>();
+services.AddSingleton<OrderFaultHandler>();
+services.AddHostedService<MessageBusHostedService>();
+```
+
+A fault consumer records the failure where people will see it. It can run more than once for the
+same message (`IsRedelivery`), so make it idempotent:
+
+```csharp
+internal sealed class OrderFaultHandler(ILogger<OrderFaultHandler> logger) : IConsumer<Fault<OrderSubmitted>>
+{
+    public Task Consume(ConsumeContext<Fault<OrderSubmitted>> ctx)
+    {
+        var fault = ctx.Message;
+        logger.LogWarning("Order {OrderId} dead-lettered after {Attempts} attempts ({Reason}): {Error}",
+            fault.OriginalMessage.OrderId, fault.AttemptCount,
+            fault.Expired ? "expired" : fault.NonRetryable ? "non-retryable" : "retries exhausted",
+            fault.ExceptionMessage);
+        // e.g. mark the order as failed, alert support. Replay later with
+        // bus.ReplayDeadLettered<OrderSubmitted>(fault.MessageId).
+        return Task.CompletedTask;
+    }
+}
+```
+
+To stop work that is pointless if it runs late, give the message an expiry when you publish it. It
+is dead-lettered without calling consumers, and the fault has `Expired = true`:
+
+```csharp
+await bus.Publish(new CartHoldRequested { CartId = cartId },
+    new PublishOptions { TimeToLive = TimeSpan.FromMinutes(10) });
+```
+
+> Keep `MaxConcurrency = 1` (and no lease) when a channel needs strict ordering. Without
+> `ClaimLease`, keep `MaxBatchSize = 1` for consumers that call external services: the claimed batch
+> holds its transaction until every message in it is handled.
+
+---
+
+## Health checks, metrics and purging
+
+```csharp
+// Health: Unhealthy if polling stopped; Degraded when a queue threshold is exceeded.
+// Package: TownSuite.WorkQueues.HealthChecks
+builder.Services.AddHealthChecks().AddMessageBus(configure: o => o
+    .Queue<OrderSubmitted>(q =>
+    {
+        q.MaxOldestReadyAge = TimeSpan.FromMinutes(1);   // stopped worker / no subscriber
+        q.MaxPendingFaults  = 0;                         // fault consumer keeps failing
+    }));
+app.MapHealthChecks("/healthz");
+
+// Metrics: counters and the consumer-duration histogram are always emitted; TrackQueue adds
+// backlog gauges, refreshed in the background.
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(m => m.AddMeter(WorkQueueMetrics.MeterName).AddPrometheusExporter());
+```
+
+Queue gauges and purging both fit in one small hosted service:
+
+```csharp
+internal sealed class QueueMaintenanceService(IMessageBus bus, ILogger<QueueMaintenanceService> logger)
+    : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await using var tracking = WorkQueueMetrics.TrackQueue<OrderSubmitted>(bus, TimeSpan.FromSeconds(30));
+
+        using var timer = new PeriodicTimer(TimeSpan.FromHours(24));
+        do
+        {
+            try
+            {
+                long processed = await bus.PurgeProcessed(DateTimeOffset.UtcNow.AddDays(-30), stoppingToken);
+                long dead      = await bus.PurgeDeadLettered<OrderSubmitted>(DateTimeOffset.UtcNow.AddDays(-90), stoppingToken);
+                logger.LogInformation("Purged {Processed} processed and {Dead} dead-lettered messages", processed, dead);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogError(ex, "Queue purge failed; it will run again on the next tick");
+            }
+        }
+        while (await timer.WaitForNextTickAsync(stoppingToken));
+    }
+}
+
+builder.Services.AddHostedService<QueueMaintenanceService>();
+```
+
+Run the purge from one instance only (or accept that several instances share the work; the deletes
+are batched and safe to run concurrently).
 
 ---
 
@@ -527,6 +684,12 @@ public class WorkQueueSettings
     public int    MaxBatchSize          { get; set; } = 50;
     public int    MaxRetries            { get; set; } = 3;
     public double MaxWaitSeconds        { get; set; } = 2;
+    public int    MaxConcurrency        { get; set; } = 1;
+    public double? ClaimLeaseSeconds    { get; set; }
+    public double RetryDelaySeconds     { get; set; }
+    public double RetryBackoffMultiplier { get; set; } = 1.0;
+    public double? MaxRetryDelaySeconds { get; set; }
+    public double FaultRedeliveryDelaySeconds { get; set; } = 60;
 }
 ```
 
@@ -545,7 +708,13 @@ builder.Services.AddSingleton(new SqlTransportOptions
     Schema                = settings.Schema,
     MaxBatchSize          = settings.MaxBatchSize,
     MaxWaitTime           = TimeSpan.FromSeconds(settings.MaxWaitSeconds),
-    MaxRetries            = settings.MaxRetries
+    MaxRetries            = settings.MaxRetries,
+    MaxConcurrency        = settings.MaxConcurrency,
+    ClaimLease            = settings.ClaimLeaseSeconds is { } lease ? TimeSpan.FromSeconds(lease) : null,
+    RetryDelay            = TimeSpan.FromSeconds(settings.RetryDelaySeconds),
+    RetryBackoffMultiplier = settings.RetryBackoffMultiplier,
+    MaxRetryDelay         = settings.MaxRetryDelaySeconds is { } max ? TimeSpan.FromSeconds(max) : null,
+    FaultRedeliveryDelay  = TimeSpan.FromSeconds(settings.FaultRedeliveryDelaySeconds)
 });
 ```
 
@@ -558,8 +727,14 @@ builder.Services.AddSingleton(new SqlTransportOptions
     "AdminConnectionString": "Host=db;Database=myapp;Username=admin;Password=secret",
     "Schema":                "transport",
     "MaxBatchSize":          50,
-    "MaxRetries":            3,
-    "MaxWaitSeconds":        2
+    "MaxRetries":            5,
+    "MaxWaitSeconds":        2,
+    "MaxConcurrency":        4,
+    "ClaimLeaseSeconds":     120,
+    "RetryDelaySeconds":     1,
+    "RetryBackoffMultiplier": 2.0,
+    "MaxRetryDelaySeconds":  60,
+    "FaultRedeliveryDelaySeconds": 60
   }
 }
 ```
@@ -665,7 +840,7 @@ When asked to add message bus processing to a Worker Service or ASP.NET Core app
    a connection string (one multiplexer per process). Then register `RedisOptions` and the bus.
 
 6. **Wire `MessageBusHostedService`** — resolve `IMessageBus` inside `StartAsync`, not in
-   the constructor. Dispose it in `StopAsync`.
+   the constructor. `await bus.DisposeAsync()` in `StopAsync` (the buses are `IAsyncDisposable` only).
 
 7. **Register all consumer classes in DI** (`AddTransient<TConsumer>`) so their own
    dependencies (loggers, `IServiceScopeFactory`, etc.) are injected.
@@ -678,3 +853,20 @@ When asked to add message bus processing to a Worker Service or ASP.NET Core app
 
 10. **Configuration:** prefer `appsettings.json` + environment variable overrides over
     hard-coded connection strings. Use `IConfiguration.GetSection(...).Get<T>()` to bind.
+
+11. **Choose a claim mode.** Consumers that call external services: set `ClaimLease` (longer than
+    the slowest consumer), or keep `MaxBatchSize = 1`. Use `MaxConcurrency` for throughput, and keep
+    it at `1` where order matters.
+
+12. **Retry only what can succeed.** Set `IsRetryable` so validation/business failures dead-letter at
+    once, and `RetryDelay` + `RetryBackoffMultiplier` for transient ones. Better still, handle expected
+    business outcomes inside the consumer and return normally.
+
+13. **Subscribe a `Fault<T>` consumer** for every message type whose failure someone must act on, and
+    make it idempotent — faults are delivered at least once.
+
+14. **Publish inside the caller's transaction** with `Publish(message, connection, transaction)` when
+    the message must only exist if the business write commits. Do not use the obsolete `IWorkQueue`.
+
+15. **Add the health check and a purge job** (`AddMessageBus`, `PurgeProcessed`) so stopped workers,
+    growing backlogs and unbounded tables are noticed.
