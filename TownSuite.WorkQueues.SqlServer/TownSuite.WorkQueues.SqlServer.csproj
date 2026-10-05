@@ -5,7 +5,7 @@
         <PackageId>TownSuite.WorkQueues.SqlServer</PackageId>
         <Description>SQL Server backend for TownSuite.WorkQueues. Provides SqlServerMessageBus with UPDLOCK+ROWLOCK+READPAST concurrency, automatic schema migration, and full IMessageBus support including scheduled delivery and dead-lettering.</Description>
         <PackageTags>workqueue;messagebus;sqlserver;sql-server;background-jobs;queue</PackageTags>
-        <PackageReleaseNotes>v2.5.0 — version aligned with TownSuite.WorkQueues 2.5.0. See CHANGELOG.md in the core package for full notes.</PackageReleaseNotes>
+        <PackageReleaseNotes>v26.1.0 — version aligned with TownSuite.WorkQueues 26.1.0 (message bus reliability features and schema changes). See CHANGELOG.md in the core package for full notes.</PackageReleaseNotes>
     </PropertyGroup>
 
     <ItemGroup>
