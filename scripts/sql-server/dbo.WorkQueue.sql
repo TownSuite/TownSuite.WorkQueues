@@ -24,3 +24,10 @@ CREATE NONCLUSTERED INDEX [IX_WorkQueue_Channel_Unprocessed] ON [dbo].[workqueue
 )
 WHERE ([timeprocessedutc] IS NULL AND [failedat] IS NULL)
 GO
+CREATE NONCLUSTERED INDEX [IX_WorkQueue_Channel_DeadLettered] ON [dbo].[workqueue]
+(
+	[channel]   ASC,
+	[messageid] ASC
+)
+WHERE ([failedat] IS NOT NULL)
+GO

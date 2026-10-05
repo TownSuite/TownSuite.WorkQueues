@@ -68,6 +68,12 @@ public class SqliteMigrationHostedService : IHostedService
                 WHERE timeprocessedutc IS NULL AND failedat IS NULL
                 """, ct);
 
+            await Exec(conn, """
+                CREATE INDEX IF NOT EXISTS IX_workqueue_channel_deadlettered
+                ON workqueue (channel, messageid)
+                WHERE failedat IS NOT NULL
+                """, ct);
+
             // Add lockeduntil / locktoken to existing databases that pre-date this schema.
             // IF NOT EXISTS is not universally supported for ALTER TABLE, so check PRAGMA table_info.
             await AddColumnIfMissingAsync(conn, "lockeduntil", "TEXT NULL", ct);

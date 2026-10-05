@@ -33,3 +33,7 @@ $$;
 CREATE INDEX IF NOT EXISTS ix_workqueue_channel_unprocessed
     ON public.workqueue (channel, timecreatedutc)
     WHERE timeprocessedutc IS NULL AND failedat IS NULL;
+
+CREATE INDEX IF NOT EXISTS ix_workqueue_channel_deadlettered
+    ON public.workqueue (channel, messageid)
+    WHERE failedat IS NOT NULL;

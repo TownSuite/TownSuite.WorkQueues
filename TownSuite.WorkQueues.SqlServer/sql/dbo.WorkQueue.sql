@@ -77,3 +77,14 @@ BEGIN
     WHERE ([timeprocessedutc] IS NULL AND [failedat] IS NULL)
 END
 GO
+-- Filtered index over dead-lettered rows for replay and queue statistics.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_workqueue_channel_deadlettered'
+      AND object_id = OBJECT_ID(N'[dbo].[workqueue]')
+)
+BEGIN
+    CREATE NONCLUSTERED INDEX [IX_workqueue_channel_deadlettered]
+    ON [dbo].[workqueue] ([channel] ASC, [messageid] ASC)
+    WHERE ([failedat] IS NOT NULL)
+END

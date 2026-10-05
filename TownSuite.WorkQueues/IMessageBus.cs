@@ -73,7 +73,47 @@ public interface IMessageBus : IAsyncDisposable
     Task<int> ReplayDeadLettered<T>(CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// <see langword="true"/> while the background polling loop is running.
+    /// Serialises <paramref name="message"/> and inserts it using the caller's
+    /// <paramref name="connection"/> and <paramref name="transaction"/>, so the message is only
+    /// published if the caller's transaction commits (the transactional outbox pattern).
+    /// Transports without a relational store throw <see cref="NotSupportedException"/>.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="message">The message to publish.</param>
+    /// <param name="connection">An open connection to the bus's database.</param>
+    /// <param name="transaction">The caller's transaction, or <see langword="null"/> to auto-commit.</param>
+    /// <param name="deliverAfter">Optional earliest delivery time.</param>
+    /// <param name="cancellationToken">Token to cancel the publish operation.</param>
+    /// <returns>The <see cref="ConsumeContext{T}.MessageId"/> assigned to the message.</returns>
+    Task<Guid> Publish<T>(T message, System.Data.Common.DbConnection connection,
+        System.Data.Common.DbTransaction? transaction, DateTimeOffset? deliverAfter = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support transactional publish. " +
+            "Use PostgresMessageBus, SqlServerMessageBus, or SqliteMessageBus.");
+
+    /// <summary>
+    /// Resets one dead-lettered message of type <typeparamref name="T"/>, identified by its
+    /// <see cref="ConsumeContext{T}.MessageId"/>, so it is redelivered on the next polling cycle.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="messageId">The message identifier (also available as <c>Fault&lt;T&gt;.MessageId</c>).</param>
+    /// <param name="cancellationToken">Token to cancel the operation.</param>
+    /// <returns><see langword="true"/> if a dead-lettered message was found and replayed.</returns>
+    Task<bool> ReplayDeadLettered<T>(Guid messageId, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support replaying a single message.");
+
+    /// <summary>
+    /// Returns pending and dead-letter counts and the age of the oldest waiting message for
+    /// the channel of type <typeparamref name="T"/>. Intended for health checks and metrics.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="cancellationToken">Token to cancel the query.</param>
+    Task<QueueStatistics> GetQueueStatistics<T>(CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support queue statistics.");
+
+    /// <summary>
+    /// <see langword="true"/> while every background polling loop is running.
     /// Use this to implement health checks: a <see langword="false"/> value after startup
     /// indicates the loop has stopped unexpectedly and the bus is no longer processing messages.
     /// </summary>

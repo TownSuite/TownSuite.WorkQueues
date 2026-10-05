@@ -33,4 +33,17 @@ public sealed class Fault<T>
 
     /// <summary>Total number of delivery attempts made before dead-lettering.</summary>
     public required int AttemptCount { get; init; }
+
+    /// <summary>
+    /// The identifier of the dead-lettered message. Pass it to
+    /// <see cref="IMessageBus.ReplayDeadLettered{T}(Guid, CancellationToken)"/> to replay just this message.
+    /// <see cref="Guid.Empty"/> for messages published before message ids were recorded.
+    /// </summary>
+    public Guid MessageId { get; init; }
+
+    /// <summary>
+    /// <see langword="true"/> when the message was dead-lettered without exhausting
+    /// <c>MaxRetries</c> because <c>BatchOptions.IsRetryable</c> returned <see langword="false"/>.
+    /// </summary>
+    public bool NonRetryable { get; init; }
 }

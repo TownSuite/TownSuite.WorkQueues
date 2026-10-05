@@ -4,6 +4,56 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### New features
+
+- **Retry backoff** — `BatchOptions.RetryBackoffMultiplier` (default `1.0`) grows `RetryDelay` on each
+  attempt; `BatchOptions.MaxRetryDelay` caps it (default one day). PostgreSQL, SQL Server and SQLite.
+  ```csharp
+  options.RetryDelay = TimeSpan.FromSeconds(1);
+  options.RetryBackoffMultiplier = 2.0;              // 1s, 2s, 4s, 8s …
+  options.MaxRetryDelay = TimeSpan.FromMinutes(5);
+  ```
+- **Non-retryable exceptions** — `BatchOptions.IsRetryable` (`Func<Exception, bool>`). Returning `false`
+  dead-letters the message on its first failure; `Fault<T>.NonRetryable` is `true`. All transports.
+- **Replay one dead-lettered message** — `IMessageBus.ReplayDeadLettered<T>(Guid messageId)`.
+  `Fault<T>.MessageId` carries the id. All transports.
+- **Transactional publish (outbox)** — `IMessageBus.Publish<T>(message, DbConnection, DbTransaction?, deliverAfter?)`
+  inserts on the caller's transaction and returns the message id. PostgreSQL, SQL Server and SQLite.
+  Replaces using `IWorkQueue.Enqueue` as an outbox.
+- **Bounded concurrency** — `BatchOptions.MaxConcurrency` (default `1`) runs that many polling loops
+  in one bus. `IsPolling` is `true` only while every loop is running. All transports.
+- **Metrics** — every transport emits counters for published, processed, retried and dead-lettered
+  messages and a consumer duration histogram on the `TownSuite.WorkQueues` meter (`WorkQueueMetrics`).
+- **Queue statistics** — `IMessageBus.GetQueueStatistics<T>()` returns pending and dead-lettered
+  counts and the age of the oldest deliverable message, for health checks and alerting. All transports.
+
+### Fixes
+
+- **`Fault<T>` consumers ran before the dead-letter was committed** (PostgreSQL, SQL Server). They now
+  run after the claim transaction commits, so a failed commit no longer reports a dead-letter that
+  did not happen, and a fault consumer that reads the row no longer blocks on its lock.
+
+### Schema changes
+
+A filtered index over dead-lettered rows speeds up replay and statistics. The migration hosted
+services add it automatically; for manually managed schemas:
+
+| Database | DDL |
+|---|---|
+| SQL Server | `CREATE NONCLUSTERED INDEX IX_workqueue_channel_deadlettered ON dbo.workqueue (channel, messageid) WHERE failedat IS NOT NULL` |
+| PostgreSQL | `CREATE INDEX IF NOT EXISTS ix_workqueue_channel_deadlettered ON workqueue (channel, messageid) WHERE failedat IS NOT NULL` |
+| SQLite | `CREATE INDEX IF NOT EXISTS IX_workqueue_channel_deadlettered ON workqueue (channel, messageid) WHERE failedat IS NOT NULL` |
+
+### Behaviour notes
+
+- `Publish` now writes `messageid` explicitly instead of relying on the column default.
+- New `IMessageBus` members have default implementations that throw `NotSupportedException`, so
+  third-party implementations keep compiling.
+
+---
+
 ## [2.5.0] — 2026-06-14
 
 ### New features

@@ -2,6 +2,8 @@ using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
+using System.Data.Common;
+using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 
@@ -38,8 +40,9 @@ public class SqliteMessageBus : IMessageBus
     private int _disposed;
     private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Guid, DateTimeOffset, Task>>> _handlers = new();
     private readonly ConcurrentDictionary<Type, ConcurrentDictionary<object, Func<object, Task>>> _faultHandlers = new();
-    private readonly ConcurrentDictionary<Type, Func<string, Exception, int, Task>> _faultDispatchers = new();
-    private readonly Task _pollingTask;
+    private readonly ConcurrentDictionary<Type, Func<string, Exception, int, Guid, bool, Task>> _faultDispatchers = new();
+    private readonly Task[] _pollingTasks;
+    private const string Transport = "sqlite";
     private readonly ILogger _logger;
     private readonly SqliteTransportOptions _options;
     private readonly IServiceProvider? _serviceProvider;
@@ -51,11 +54,13 @@ public class SqliteMessageBus : IMessageBus
         _serviceProvider = serviceProvider;
         // Yield to the caller so Subscribe() calls made immediately after construction
         // are registered before the first poll cycle runs.
-        _pollingTask = Task.Run(async () => { await Task.Yield(); await ProcessMessagesAsync(); });
+        _pollingTasks = Enumerable.Range(0, Math.Max(1, options.MaxConcurrency))
+            .Select(_ => Task.Run(async () => { await Task.Yield(); await ProcessMessagesAsync(); }))
+            .ToArray();
     }
 
     /// <inheritdoc />
-    public bool IsPolling => !_pollingTask.IsCompleted && !_pollingTask.IsFaulted;
+    public bool IsPolling => _pollingTasks.All(t => !t.IsCompleted);
 
     /// <inheritdoc />
     public void Subscribe<T>(IConsumer<T> consumer)
@@ -111,7 +116,7 @@ public class SqliteMessageBus : IMessageBus
 
     private void EnsureFaultDispatcher<T>()
     {
-        _faultDispatchers.TryAdd(typeof(T), async (payload, ex, attemptCount) =>
+        _faultDispatchers.TryAdd(typeof(T), async (payload, ex, attemptCount, messageId, nonRetryable) =>
         {
             if (!_faultHandlers.TryGetValue(typeof(T), out var handlers) || handlers.IsEmpty)
                 return;
@@ -126,7 +131,9 @@ public class SqliteMessageBus : IMessageBus
                 ExceptionMessage = ex.Message,
                 StackTrace       = ex.StackTrace,
                 FaultedAt        = DateTimeOffset.UtcNow,
-                AttemptCount     = attemptCount
+                AttemptCount     = attemptCount,
+                MessageId        = messageId,
+                NonRetryable     = nonRetryable
             };
 
             await Task.WhenAll(handlers.Values.Select(h => h(fault)));
@@ -136,43 +143,64 @@ public class SqliteMessageBus : IMessageBus
     /// <inheritdoc />
     public async Task Publish<T>(T message, CancellationToken cancellationToken = default)
     {
-        var channel = typeof(T).FullName
-            ?? throw new InvalidOperationException($"Cannot determine channel name for type {typeof(T)}");
-        if (channel.Length > 500)
-            throw new ArgumentException($"Message type name exceeds 500 characters: {channel}");
-
-        var payload   = JsonSerializer.Serialize(message);
-        var messageId = Guid.NewGuid().ToString();
-
         await using var conn = await OpenConnectionAsync(cancellationToken);
-        await using var cmd  = conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO workqueue(channel, payload, messageid) VALUES(@channel, @payload, @messageid)";
-        cmd.Parameters.AddWithValue("@channel",   channel);
-        cmd.Parameters.AddWithValue("@payload",   payload);
-        cmd.Parameters.AddWithValue("@messageid", messageId);
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+        await InsertAsync(message, conn, null, null, cancellationToken);
     }
 
     /// <inheritdoc />
     public async Task Publish<T>(T message, DateTimeOffset deliverAfter, CancellationToken cancellationToken = default)
     {
+        await using var conn = await OpenConnectionAsync(cancellationToken);
+        await InsertAsync(message, conn, null, deliverAfter, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <paramref name="connection"/> must be a <see cref="SqliteConnection"/> to the file the bus
+    /// polls and <paramref name="transaction"/> (when supplied) a <see cref="SqliteTransaction"/> on it.
+    /// </remarks>
+    public async Task<Guid> Publish<T>(T message, DbConnection connection, DbTransaction? transaction,
+        DateTimeOffset? deliverAfter = null, CancellationToken cancellationToken = default)
+    {
+        if (connection is not SqliteConnection sqliteConnection)
+            throw new ArgumentException("connection must be a SqliteConnection", nameof(connection));
+        if (transaction != null && transaction is not SqliteTransaction)
+            throw new ArgumentException("transaction must be a SqliteTransaction", nameof(transaction));
+
+        if (sqliteConnection.State == System.Data.ConnectionState.Closed)
+            await sqliteConnection.OpenAsync(cancellationToken);
+
+        return await InsertAsync(message, sqliteConnection, transaction as SqliteTransaction, deliverAfter, cancellationToken);
+    }
+
+    private static async Task<Guid> InsertAsync<T>(T message, SqliteConnection conn, SqliteTransaction? tran,
+        DateTimeOffset? deliverAfter, CancellationToken cancellationToken)
+    {
+        var channel   = ChannelName<T>();
+        var payload   = JsonSerializer.Serialize(message);
+        var messageId = Guid.NewGuid();
+
+        await using var cmd = conn.CreateCommand();
+        cmd.Transaction = tran;
+        cmd.CommandText = "INSERT INTO workqueue(channel, payload, messageid, scheduledfor) VALUES(@channel, @payload, @messageid, @scheduledfor)";
+        cmd.Parameters.AddWithValue("@channel",     channel);
+        cmd.Parameters.AddWithValue("@payload",     payload);
+        cmd.Parameters.AddWithValue("@messageid",   messageId.ToString());
+        cmd.Parameters.AddWithValue("@scheduledfor",
+            deliverAfter.HasValue ? ToSqliteDateTime(deliverAfter.Value.UtcDateTime) : DBNull.Value);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+
+        WorkQueueMetrics.RecordPublished(Transport, channel);
+        return messageId;
+    }
+
+    private static string ChannelName<T>()
+    {
         var channel = typeof(T).FullName
             ?? throw new InvalidOperationException($"Cannot determine channel name for type {typeof(T)}");
         if (channel.Length > 500)
             throw new ArgumentException($"Message type name exceeds 500 characters: {channel}");
-
-        var payload      = JsonSerializer.Serialize(message);
-        var messageId    = Guid.NewGuid().ToString();
-        var scheduledFor = ToSqliteDateTime(deliverAfter.UtcDateTime);
-
-        await using var conn = await OpenConnectionAsync(cancellationToken);
-        await using var cmd  = conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO workqueue(channel, payload, messageid, scheduledfor) VALUES(@channel, @payload, @messageid, @scheduledfor)";
-        cmd.Parameters.AddWithValue("@channel",     channel);
-        cmd.Parameters.AddWithValue("@payload",     payload);
-        cmd.Parameters.AddWithValue("@messageid",   messageId);
-        cmd.Parameters.AddWithValue("@scheduledfor", scheduledFor);
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+        return channel;
     }
 
     /// <inheritdoc />
@@ -191,6 +219,57 @@ public class SqliteMessageBus : IMessageBus
             """;
         cmd.Parameters.AddWithValue("@channel", channel);
         return await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> ReplayDeadLettered<T>(Guid messageId, CancellationToken cancellationToken = default)
+    {
+        await using var conn = await OpenConnectionAsync(cancellationToken);
+        await using var cmd  = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE workqueue
+            SET failedat = NULL, retrycount = 0, scheduledfor = NULL,
+                lockeduntil = NULL, locktoken = NULL
+            WHERE channel = @channel AND messageid = @messageid AND failedat IS NOT NULL
+            """;
+        cmd.Parameters.AddWithValue("@channel",   ChannelName<T>());
+        cmd.Parameters.AddWithValue("@messageid", messageId.ToString());
+        return await cmd.ExecuteNonQueryAsync(cancellationToken) > 0;
+    }
+
+    /// <inheritdoc />
+    public async Task<QueueStatistics> GetQueueStatistics<T>(CancellationToken cancellationToken = default)
+    {
+        var channel = ChannelName<T>();
+        var now     = DateTime.UtcNow;
+
+        await using var conn = await OpenConnectionAsync(cancellationToken);
+        await using var cmd  = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT
+                (SELECT COUNT(*) FROM workqueue
+                 WHERE channel = @channel AND timeprocessedutc IS NULL AND failedat IS NULL),
+                (SELECT COUNT(*) FROM workqueue
+                 WHERE channel = @channel AND failedat IS NOT NULL),
+                (SELECT MIN(COALESCE(scheduledfor, timecreatedutc)) FROM workqueue
+                 WHERE channel = @channel AND timeprocessedutc IS NULL AND failedat IS NULL
+                   AND (scheduledfor IS NULL OR scheduledfor <= @now))
+            """;
+        cmd.Parameters.AddWithValue("@channel", channel);
+        cmd.Parameters.AddWithValue("@now",     ToSqliteDateTime(now));
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+
+        return new QueueStatistics
+        {
+            Channel           = channel,
+            PendingCount      = reader.GetInt64(0),
+            DeadLetteredCount = reader.GetInt64(1),
+            OldestReadySince  = reader.IsDBNull(2)
+                ? null
+                : DateTimeOffset.Parse(reader.GetString(2), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal),
+            CapturedAt        = new DateTimeOffset(now, TimeSpan.Zero)
+        };
     }
 
     private async Task ProcessMessagesAsync()
@@ -295,20 +374,20 @@ public class SqliteMessageBus : IMessageBus
 
         foreach (var msg in messages)
         {
-            bool success = false;
             Exception? lastException = null;
+            var stopwatch = Stopwatch.StartNew();
             try
             {
                 await DispatchMessageAsync(msg);
-                success = true;
             }
             catch (Exception ex)
             {
                 lastException = ex;
                 _logger.LogError(ex, "Handler failed for message {Id} on channel {Channel}", msg.Id, msg.Channel);
             }
+            stopwatch.Stop();
 
-            if (success)
+            if (lastException == null)
             {
                 await using var completeCmd = conn.CreateCommand();
                 completeCmd.CommandText = """
@@ -319,12 +398,17 @@ public class SqliteMessageBus : IMessageBus
                 completeCmd.Parameters.AddWithValue("@now", ToSqliteDateTime(DateTime.UtcNow));
                 completeCmd.Parameters.AddWithValue("@id",  msg.Id);
                 await completeCmd.ExecuteNonQueryAsync(_cts.Token);
+                WorkQueueMetrics.RecordProcessed(Transport, msg.Channel, stopwatch.Elapsed);
             }
             else
             {
-                bool willDeadLetter = msg.RetryCount + 1 >= _options.MaxRetries;
-                object scheduledFor = !willDeadLetter && _options.RetryDelay > TimeSpan.Zero
-                    ? ToSqliteDateTime(DateTime.UtcNow.Add(_options.RetryDelay))
+                int attempt = msg.RetryCount + 1;
+                bool nonRetryable = !_options.ShouldRetry(lastException);
+                bool willDeadLetter = nonRetryable || attempt >= _options.MaxRetries;
+                var retryDelay = _options.GetRetryDelay(attempt);
+
+                object scheduledFor = !willDeadLetter && retryDelay > TimeSpan.Zero
+                    ? ToSqliteDateTime(DateTime.UtcNow.Add(retryDelay))
                     : DBNull.Value;
                 object failedAt = willDeadLetter
                     ? ToSqliteDateTime(DateTime.UtcNow)
@@ -345,17 +429,25 @@ public class SqliteMessageBus : IMessageBus
                 retryCmd.Parameters.AddWithValue("@scheduledfor", scheduledFor);
                 await retryCmd.ExecuteNonQueryAsync(_cts.Token);
 
-                if (willDeadLetter && lastException != null)
+                if (willDeadLetter)
                 {
+                    WorkQueueMetrics.RecordDeadLettered(Transport, msg.Channel, stopwatch.Elapsed);
+
+                    // The UPDATE above auto-commits, so the dead-letter is durable before the
+                    // fault consumer runs.
                     var msgType = _handlers.Keys.FirstOrDefault(t => t.FullName == msg.Channel);
                     if (msgType != null && _faultDispatchers.TryGetValue(msgType, out var dispatcher))
                     {
-                        try { await dispatcher(msg.Payload, lastException, msg.RetryCount + 1); }
+                        try { await dispatcher(msg.Payload, lastException, attempt, msg.MessageId, nonRetryable); }
                         catch (Exception fex)
                         {
                             _logger.LogError(fex, "Fault consumer threw for dead-lettered message {Id}", msg.Id);
                         }
                     }
+                }
+                else
+                {
+                    WorkQueueMetrics.RecordRetried(Transport, msg.Channel, stopwatch.Elapsed);
                 }
             }
         }
@@ -399,7 +491,7 @@ public class SqliteMessageBus : IMessageBus
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cts.Cancel();
-        try { await _pollingTask.WaitAsync(TimeSpan.FromSeconds(10)); }
+        try { await Task.WhenAll(_pollingTasks).WaitAsync(TimeSpan.FromSeconds(10)); }
         catch (OperationCanceledException) { }
         catch (TimeoutException) { }
         _cts.Dispose();

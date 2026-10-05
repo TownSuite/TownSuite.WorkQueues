@@ -102,7 +102,12 @@ cycle (within `MaxWaitTime`, default 5 s).
 - [Redis Backend](#redis-backend)
 - [Dead-Letter Queue & Retries](#dead-letter-queue--retries)
   - [Programmatic replay via ReplayDeadLettered\<T\>](#programmatic-replay-via-replaydeadletteredt)
+  - [Retry backoff](#retry-backoff)
+  - [Non-retryable exceptions](#non-retryable-exceptions)
   - [Checking bus health with IsPolling](#checking-bus-health-with-ispolling)
+- [Transactional Publish (outbox)](#transactional-publish-outbox)
+- [Concurrency](#concurrency)
+- [Monitoring: Metrics & Queue Statistics](#monitoring-metrics--queue-statistics)
 - [Configuration Reference](#configuration-reference)
 - [Running the Tests](#running-the-tests)
 - [Upgrading from Earlier Versions](#upgrading-from-earlier-versions)
@@ -552,6 +557,45 @@ int replayed = await bus.ReplayDeadLettered<OrderSubmitted>();
 
 For Redis, this reads entries from the `{prefix}:stream:{type}:dead` key and re-enqueues them to the main stream.
 
+To replay one message, pass its id. `Fault<T>.MessageId` and `ConsumeContext<T>.MessageId` carry it, so an
+admin endpoint or a support tool can replay exactly the message that failed:
+
+```csharp
+bool replayed = await bus.ReplayDeadLettered<PaymentConfirmed>(fault.MessageId);
+```
+
+It returns `false` when no dead-lettered message with that id exists on the channel.
+
+### Retry backoff
+
+`RetryDelay` holds a failed message back before its next attempt. Set `RetryBackoffMultiplier` to grow
+the delay on each attempt, and `MaxRetryDelay` to cap it (without a cap, delays stop growing at one day):
+
+```csharp
+var options = new SqlServerTransportOptions
+{
+    MaxRetries             = 10,
+    RetryDelay             = TimeSpan.FromSeconds(1),   // 1s, 2s, 4s, 8s … 5 min
+    RetryBackoffMultiplier = 2.0,
+    MaxRetryDelay          = TimeSpan.FromMinutes(5)
+};
+```
+
+Backoff applies to the PostgreSQL, SQL Server and SQLite transports. Redis retries after
+`RedisOptions.ReclaimIdleTime` and ignores `RetryDelay`, `RetryBackoffMultiplier` and `MaxRetryDelay`.
+
+### Non-retryable exceptions
+
+By default every consumer exception is retried. When some failures can never succeed (bad input, a
+business rule), set `IsRetryable` to dead-letter them on the first failure instead of retrying:
+
+```csharp
+options.IsRetryable = ex => ex is not ValidationException;
+```
+
+The `Fault<T>` consumer still runs, with `Fault<T>.NonRetryable = true`. Prefer handling expected business
+outcomes inside the consumer (record the result and return normally) and throw only for faults.
+
 ### Checking bus health with `IsPolling`
 
 `IMessageBus.IsPolling` is `true` while the background polling loop is alive. Wire it into ASP.NET Core health checks to detect a silently-stopped bus:
@@ -568,6 +612,106 @@ builder.Services.AddHealthChecks()
     });
 ```
 
+`IsPolling` only says the loop is alive. To catch a channel nobody is consuming, alert on queue age
+(see [Monitoring](#monitoring-metrics--queue-statistics)): a bus only claims messages for types it has
+subscribed to, so messages published to a channel with no subscribed bus stay pending indefinitely.
+
+### When fault consumers run
+
+`Fault<T>` consumers run after the dead-letter state is committed, so a fault consumer that reads the
+row (or replays it) sees `failedat` set. A fault consumer that throws is logged and does not affect the
+message.
+
+---
+
+## Transactional Publish (outbox)
+
+`Publish` normally opens its own connection. To publish only if your own database work commits, pass
+your connection and transaction. The message and your rows commit or roll back together:
+
+```csharp
+await using var cn = new SqlConnection(connectionString);
+await cn.OpenAsync();
+await using var tx = cn.BeginTransaction();
+
+await cn.ExecuteAsync("INSERT INTO PortalJob (JobId, Status) VALUES (@jobId, 'Queued')", new { jobId }, tx);
+Guid messageId = await bus.Publish(new CartAddItemRequested { JobId = jobId }, cn, tx);
+
+tx.Commit();
+```
+
+The connection must be to the database the bus polls (`SqlConnection`, `NpgsqlConnection` or
+`SqliteConnection` to match the transport). An optional `deliverAfter` schedules the message. It
+returns the message id that consumers see as `ConsumeContext<T>.MessageId`. Redis does not support it.
+
+Use this in place of the legacy `IWorkQueue.Enqueue(channel, payload, cn, txn)`. It needs no stored
+procedure and returns the message id.
+
+---
+
+## Concurrency
+
+Each bus processes its claimed batch one message at a time. Set `MaxConcurrency` to run several polling
+loops in one bus. Each loop claims its own batch, so at most `MaxConcurrency × MaxBatchSize` messages are
+in flight:
+
+```csharp
+var options = new SqlServerTransportOptions
+{
+    MaxConcurrency = 4,   // up to 4 messages at once
+    MaxBatchSize   = 1
+};
+```
+
+Ordering is only guaranteed with `MaxConcurrency = 1`. Concurrency is per bus instance; several
+processes or bus instances on the same database also share the work safely.
+
+**Keep `MaxBatchSize` small for slow consumers.** On PostgreSQL and SQL Server the claimed batch is held
+in one open transaction (with row locks) until every message in it is handled, and outcomes are committed
+together. A consumer that calls an external service should use `MaxBatchSize = 1`, so one slow message
+does not delay or hold locks on others. Raise `MaxConcurrency` for throughput instead.
+
+Your consumer's own database work runs on its own connection, separate from the claim transaction. If the
+process dies between your commit and the claim commit, the message is redelivered, so consumers must be
+idempotent (check `MessageId` or your own state first).
+
+---
+
+## Monitoring: Metrics & Queue Statistics
+
+### Metrics
+
+Every transport emits `System.Diagnostics.Metrics` instruments on the meter `TownSuite.WorkQueues`
+(`WorkQueueMetrics.MeterName`), tagged with `messaging.system` and `messaging.destination.name` (the channel):
+
+| Instrument | Type | Meaning |
+|---|---|---|
+| `townsuite.workqueues.messages.published` | counter | Messages published |
+| `townsuite.workqueues.messages.processed` | counter | Successful deliveries |
+| `townsuite.workqueues.messages.retried` | counter | Failed deliveries that will be retried |
+| `townsuite.workqueues.messages.deadlettered` | counter | Messages dead-lettered |
+| `townsuite.workqueues.message.duration` | histogram (s) | Consumer time per attempt |
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(m => m.AddMeter(WorkQueueMetrics.MeterName).AddPrometheusExporter());
+```
+
+### Queue statistics
+
+Backlog size and age need a query, so they are read on demand:
+
+```csharp
+QueueStatistics stats = await bus.GetQueueStatistics<CartAddItemRequested>();
+// stats.PendingCount       — not yet processed (includes scheduled and waiting-for-retry)
+// stats.DeadLetteredCount  — dead-lettered and held for replay
+// stats.OldestReadyAge     — how long the oldest deliverable message has waited (null if none)
+```
+
+Alert when `OldestReadyAge` grows past what the channel should tolerate: it catches slow consumers,
+stopped workers and channels with no subscriber. Messages scheduled for the future are not counted
+towards the age until they become due. Expose the values as observable gauges or use them in a health check.
+
 ---
 
 ## Configuration Reference
@@ -580,6 +724,11 @@ builder.Services.AddHealthChecks()
 | `MaxWaitTime` | `5s` | How long to pause when the queue is empty before polling again |
 | `ContinuousPolling` | `false` | When `true`, skips the `MaxWaitTime` delay between empty polls. Use only in tests or latency-critical scenarios — otherwise leaves CPU and database idle time on the table. |
 | `MaxRetries` | `3` | Delivery attempts before a message is dead-lettered |
+| `RetryDelay` | `0` | Delay before a failed message is retried (SQL transports) |
+| `RetryBackoffMultiplier` | `1.0` | Multiplier applied to `RetryDelay` for each further attempt |
+| `MaxRetryDelay` | `null` (1 day) | Cap on the computed retry delay |
+| `MaxConcurrency` | `1` | Polling loops run in parallel by one bus |
+| `IsRetryable` | `null` (retry all) | Return `false` to dead-letter an exception immediately |
 
 ### `SqlTransportOptions` (extends `BatchOptions`)
 
