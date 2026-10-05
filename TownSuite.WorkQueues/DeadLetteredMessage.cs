@@ -50,6 +50,9 @@ public sealed class DeadLetteredMessage<T>
     /// </summary>
     public bool NonRetryable { get; init; }
 
+    /// <summary><see langword="true"/> when the message expired before it was delivered.</summary>
+    public bool Expired { get; init; }
+
     /// <summary>
     /// <see langword="true"/> once a <see cref="Fault{T}"/> for this dead-letter has been delivered
     /// to a fault consumer.

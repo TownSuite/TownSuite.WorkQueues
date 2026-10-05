@@ -8,6 +8,7 @@ namespace TownSuite.WorkQueues;
 /// Implementations use <c>FOR UPDATE SKIP LOCKED</c> (or an equivalent) so multiple concurrent
 /// workers can safely dequeue from the same channel without blocking each other.
 /// </summary>
+[Obsolete("Legacy work queue API. Use IMessageBus: Publish/Subscribe, or Publish(message, connection, transaction) to enqueue inside your own transaction. See MIGRATING.md.", DiagnosticId = "TSWQ001")]
 public interface IWorkQueue
 {
     /// <summary>

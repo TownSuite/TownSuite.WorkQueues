@@ -60,7 +60,8 @@ public class SqliteMigrationHostedService : IHostedService
                     lockeduntil      TEXT     NULL,
                     locktoken        TEXT     NULL,
                     faultdispatchedat TEXT    NULL,
-                    lasterror        TEXT     NULL
+                    lasterror        TEXT     NULL,
+                    expiresat        TEXT     NULL
                 )
                 """, ct);
 
@@ -81,11 +82,18 @@ public class SqliteMigrationHostedService : IHostedService
             await AddColumnIfMissingAsync(conn, "lockeduntil", "TEXT NULL", ct);
             await AddColumnIfMissingAsync(conn, "locktoken",   "TEXT NULL", ct);
             await AddColumnIfMissingAsync(conn, "lasterror",   "TEXT NULL", ct);
+            await AddColumnIfMissingAsync(conn, "expiresat",   "TEXT NULL", ct);
 
             // Existing dead-letters are marked as already notified so the upgrade does not
             // send faults for them.
             if (await AddColumnIfMissingAsync(conn, "faultdispatchedat", "TEXT NULL", ct))
                 await Exec(conn, "UPDATE workqueue SET faultdispatchedat = failedat WHERE failedat IS NOT NULL", ct);
+
+            await Exec(conn, """
+                CREATE INDEX IF NOT EXISTS IX_workqueue_processed
+                ON workqueue (timeprocessedutc)
+                WHERE timeprocessedutc IS NOT NULL
+                """, ct);
 
             await Exec(conn, """
                 CREATE INDEX IF NOT EXISTS IX_workqueue_channel_pendingfault

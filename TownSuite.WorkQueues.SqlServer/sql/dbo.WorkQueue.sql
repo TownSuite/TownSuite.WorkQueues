@@ -13,6 +13,9 @@ BEGIN
         [scheduledfor]     DATETIME         NULL,
         [faultdispatchedat] DATETIME        NULL,
         [lasterror]        NVARCHAR(MAX)    NULL,
+        [expiresat]        DATETIME         NULL,
+        [lockeduntil]      DATETIME         NULL,
+        [locktoken]        UNIQUEIDENTIFIER NULL,
         CONSTRAINT [PK_workqueue] PRIMARY KEY CLUSTERED ([id] ASC)
     )
 END
@@ -76,6 +79,33 @@ BEGIN
     EXEC(N'UPDATE [dbo].[workqueue] SET [faultdispatchedat] = [failedat] WHERE [failedat] IS NOT NULL')
 END
 GO
+-- Add expiresat column if upgrading from a schema that pre-dates it.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[workqueue]') AND name = N'expiresat'
+)
+BEGIN
+    ALTER TABLE [dbo].[workqueue] ADD [expiresat] DATETIME NULL
+END
+GO
+-- Add lockeduntil column if upgrading from a schema that pre-dates it.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[workqueue]') AND name = N'lockeduntil'
+)
+BEGIN
+    ALTER TABLE [dbo].[workqueue] ADD [lockeduntil] DATETIME NULL
+END
+GO
+-- Add locktoken column if upgrading from a schema that pre-dates it.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[workqueue]') AND name = N'locktoken'
+)
+BEGIN
+    ALTER TABLE [dbo].[workqueue] ADD [locktoken] UNIQUEIDENTIFIER NULL
+END
+GO
 -- Widen channel column if upgrading from nvarchar(50).
 IF EXISTS (
     SELECT 1 FROM sys.columns
@@ -121,4 +151,16 @@ BEGIN
     CREATE NONCLUSTERED INDEX [IX_workqueue_channel_pendingfault]
     ON [dbo].[workqueue] ([channel] ASC, [failedat] ASC)
     WHERE ([failedat] IS NOT NULL AND [faultdispatchedat] IS NULL)
+END
+GO
+-- Filtered index over processed rows, for PurgeProcessed.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_workqueue_processed'
+      AND object_id = OBJECT_ID(N'[dbo].[workqueue]')
+)
+BEGIN
+    CREATE NONCLUSTERED INDEX [IX_workqueue_processed]
+    ON [dbo].[workqueue] ([timeprocessedutc] ASC)
+    WHERE ([timeprocessedutc] IS NOT NULL)
 END

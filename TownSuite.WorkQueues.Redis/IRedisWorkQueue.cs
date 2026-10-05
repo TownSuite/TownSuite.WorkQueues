@@ -8,6 +8,7 @@ namespace TownSuite.WorkQueues.Redis;
 /// There is no retry or dead-letter logic in this queue. Use <see cref="RedisMessageBus"/>
 /// (via <see cref="IMessageBus"/>) when you need automatic retry and dead-lettering.
 /// </remarks>
+[Obsolete("Legacy Redis list queue without retry or dead-lettering. Use RedisMessageBus (IMessageBus). See MIGRATING.md.", DiagnosticId = "TSWQ001")]
 public interface IRedisWorkQueue
 {
     /// <summary>

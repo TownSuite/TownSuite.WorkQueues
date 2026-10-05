@@ -15,13 +15,15 @@ internal sealed class StoredError
     [JsonPropertyName("message")]      public string Message { get; init; } = string.Empty;
     [JsonPropertyName("stackTrace")]   public string? StackTrace { get; init; }
     [JsonPropertyName("nonRetryable")] public bool NonRetryable { get; init; }
+    [JsonPropertyName("expired")]      public bool Expired { get; init; }
 
     public static StoredError From(Exception ex, bool nonRetryable) => new()
     {
         Type         = ex.GetType().FullName ?? ex.GetType().Name,
         Message      = ex.Message,
         StackTrace   = ex.StackTrace,
-        NonRetryable = nonRetryable
+        NonRetryable = nonRetryable,
+        Expired      = ex is MessageExpiredException
     };
 
     public string ToJson() => JsonSerializer.Serialize(this);
@@ -42,7 +44,11 @@ internal sealed record FaultInfo(
     int AttemptCount,
     DateTimeOffset FaultedAt,
     StoredError? Error,
-    bool IsRedelivery);
+    bool IsRedelivery)
+{
+    // Key the pending fault is stored under, when the transport does not use the message id.
+    public string? FaultKey { get; init; }
+}
 
 /// <summary>
 /// Holds the <see cref="Fault{T}"/> consumers subscribed on one bus and delivers faults to them.
@@ -79,7 +85,8 @@ internal sealed class FaultRegistry
                 AttemptCount     = info.AttemptCount,
                 MessageId        = info.MessageId,
                 NonRetryable     = info.Error?.NonRetryable ?? false,
-                IsRedelivery     = info.IsRedelivery
+                IsRedelivery     = info.IsRedelivery,
+                Expired          = info.Error?.Expired ?? false
             };
             await consumer.Consume(new SimpleConsumeContext<Fault<T>>(fault, token));
         });
@@ -123,6 +130,7 @@ internal sealed class FaultRegistry
             ExceptionMessage = error?.Message,
             StackTrace       = error?.StackTrace,
             NonRetryable     = error?.NonRetryable ?? false,
+            Expired          = error?.Expired ?? false,
             FaultDelivered   = faultDelivered
         };
     }

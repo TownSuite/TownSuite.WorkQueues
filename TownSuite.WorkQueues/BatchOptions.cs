@@ -77,6 +77,17 @@
         public TimeSpan FaultRedeliveryDelay { get; set; } = TimeSpan.FromMinutes(1);
 
         /// <summary>
+        /// PostgreSQL and SQL Server only. When set, claimed messages are held by a lease of this
+        /// length (<c>lockeduntil</c>/<c>locktoken</c> columns) instead of an open transaction, so no
+        /// row locks or transaction stay open while consumers run and <see cref="MaxBatchSize"/> no
+        /// longer has to be small for slow consumers. A message whose consumer outlives the lease, or
+        /// whose process dies, is delivered again once the lease expires — set it comfortably above
+        /// the slowest consumer. <see langword="null"/> (the default) claims inside a transaction,
+        /// which makes a crashed claim available again immediately.
+        /// </summary>
+        public TimeSpan? ClaimLease { get; set; }
+
+        /// <summary>
         /// Returns the delay to apply before the given retry attempt.
         /// </summary>
         /// <param name="attempt">The 1-based number of the failed attempt being retried.</param>

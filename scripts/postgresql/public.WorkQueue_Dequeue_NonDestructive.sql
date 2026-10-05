@@ -6,7 +6,7 @@ CREATE OR REPLACE PROCEDURE public.workqueue_dequeue_nondestructive(
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    update public.workqueue set timeprocessedutc = CURRENT_TIMESTAMP
+    update public.workqueue set timeprocessedutc = (now() AT TIME ZONE 'utc')
     WHERE id IN (
         WITH cte AS (
             SELECT id, payload

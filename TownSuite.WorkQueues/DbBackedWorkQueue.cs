@@ -14,6 +14,7 @@ namespace TownSuite.WorkQueues;
 /// Compatible with both PostgreSQL and SQL Server — the stored procedures are supplied via the
 /// migration services in the respective transport packages.
 /// </remarks>
+[Obsolete("Legacy work queue API. Use IMessageBus: Publish/Subscribe, or Publish(message, connection, transaction) to enqueue inside your own transaction. See MIGRATING.md.", DiagnosticId = "TSWQ001")]
 public class DbBackedWorkQueue : IWorkQueue
 {
     // http://rusanu.com/2010/03/26/using-tables-as-queues/

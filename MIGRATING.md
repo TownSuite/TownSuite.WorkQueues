@@ -262,6 +262,9 @@ This is the most common migration pitfall. The table below summarises options:
 
 ---
 
+> `IWorkQueue` and `DbBackedWorkQueue` are now `[Obsolete]` (diagnostic `TSWQ001`). They keep working;
+> suppress the warning with `<NoWarn>$(NoWarn);TSWQ001</NoWarn>` until a project is migrated.
+
 ## Transactional publishing
 
 To publish only if your business transaction commits, pass your connection and transaction to
@@ -276,8 +279,9 @@ txn.Commit();
 ```
 
 The connection must be to the database the bus polls, of the transport's own type (`NpgsqlConnection`,
-`SqlConnection` or `SqliteConnection`). Pass `deliverAfter` to schedule the message. The returned id is
-the `ConsumeContext<T>.MessageId` consumers see. Redis has no transactional publish.
+`SqlConnection` or `SqliteConnection`). Pass `PublishOptions` to schedule the message or give it an
+expiry. The returned id is the `ConsumeContext<T>.MessageId` consumers see. On Redis, pass an
+`ITransaction` (`redisBus.Publish(message, transaction)`) to publish inside your own `MULTI`/`EXEC`.
 
 > Older versions recommended `IWorkQueue.Enqueue(typeof(T).FullName, payload, cn, txn)` for this.
 > That still works, but it needs the `workqueue_enqueue` stored procedure and does not return the

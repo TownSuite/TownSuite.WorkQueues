@@ -14,6 +14,9 @@ CREATE TABLE [dbo].[workqueue](
 	[scheduledfor]     [datetime]        NULL,
 	[faultdispatchedat] [datetime]       NULL,
 	[lasterror]        [nvarchar](max)   NULL,
+	[expiresat]        [datetime]        NULL,
+	[lockeduntil]      [datetime]        NULL,
+	[locktoken]        UNIQUEIDENTIFIER  NULL,
 	CONSTRAINT [PK_WorkQueue] PRIMARY KEY CLUSTERED ([id] ASC)
 		WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF,
 		      ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
@@ -39,4 +42,10 @@ CREATE NONCLUSTERED INDEX [IX_WorkQueue_Channel_PendingFault] ON [dbo].[workqueu
 	[failedat] ASC
 )
 WHERE ([failedat] IS NOT NULL AND [faultdispatchedat] IS NULL)
+GO
+CREATE NONCLUSTERED INDEX [IX_WorkQueue_Processed] ON [dbo].[workqueue]
+(
+	[timeprocessedutc] ASC
+)
+WHERE ([timeprocessedutc] IS NOT NULL)
 GO

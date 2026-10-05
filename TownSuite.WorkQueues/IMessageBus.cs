@@ -46,6 +46,18 @@ public interface IMessageBus : IAsyncDisposable
             "Use PostgresMessageBus, SqlServerMessageBus, or SqliteMessageBus.");
 
     /// <summary>
+    /// Serialises <paramref name="message"/> and inserts it with per-message options such as a
+    /// delivery time or an expiry.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="message">The message to publish.</param>
+    /// <param name="options">Delivery time and expiry for this message.</param>
+    /// <param name="cancellationToken">Token to cancel the publish operation.</param>
+    /// <returns>The <see cref="ConsumeContext{T}.MessageId"/> assigned to the message.</returns>
+    Task<Guid> Publish<T>(T message, PublishOptions options, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support publish options.");
+
+    /// <summary>
     /// Registers <paramref name="consumer"/> to receive messages of type <typeparamref name="T"/>.
     /// Multiple consumers may be subscribed to the same type; each receives every message.
     /// Subscribe before the bus starts delivering — call this immediately after construction
@@ -86,11 +98,11 @@ public interface IMessageBus : IAsyncDisposable
     /// <param name="message">The message to publish.</param>
     /// <param name="connection">An open connection to the bus's database.</param>
     /// <param name="transaction">The caller's transaction, or <see langword="null"/> to auto-commit.</param>
-    /// <param name="deliverAfter">Optional earliest delivery time.</param>
+    /// <param name="options">Optional delivery time and expiry.</param>
     /// <param name="cancellationToken">Token to cancel the publish operation.</param>
     /// <returns>The <see cref="ConsumeContext{T}.MessageId"/> assigned to the message.</returns>
     Task<Guid> Publish<T>(T message, System.Data.Common.DbConnection connection,
-        System.Data.Common.DbTransaction? transaction, DateTimeOffset? deliverAfter = null,
+        System.Data.Common.DbTransaction? transaction, PublishOptions? options = null,
         CancellationToken cancellationToken = default)
         => throw new NotSupportedException(
             $"{GetType().Name} does not support transactional publish. " +
@@ -118,6 +130,28 @@ public interface IMessageBus : IAsyncDisposable
     Task<IReadOnlyList<DeadLetteredMessage<T>>> GetDeadLettered<T>(int skip = 0, int take = 100,
         CancellationToken cancellationToken = default)
         => throw new NotSupportedException($"{GetType().Name} does not support listing dead-lettered messages.");
+
+    /// <summary>
+    /// Deletes successfully processed messages (on every channel) processed before
+    /// <paramref name="processedBefore"/>. Deletes in small batches so it can run against a busy
+    /// queue. Run it on a schedule to keep the store from growing without bound.
+    /// </summary>
+    /// <param name="processedBefore">Only messages processed before this time are deleted.</param>
+    /// <param name="cancellationToken">Token to cancel the purge between batches.</param>
+    /// <returns>The number of messages deleted.</returns>
+    Task<long> PurgeProcessed(DateTimeOffset processedBefore, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support purging.");
+
+    /// <summary>
+    /// Deletes dead-lettered messages of type <typeparamref name="T"/> that were dead-lettered
+    /// before <paramref name="failedBefore"/>, including any fault not yet delivered for them.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="failedBefore">Only messages dead-lettered before this time are deleted.</param>
+    /// <param name="cancellationToken">Token to cancel the purge between batches.</param>
+    /// <returns>The number of messages deleted.</returns>
+    Task<long> PurgeDeadLettered<T>(DateTimeOffset failedBefore, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support purging.");
 
     /// <summary>
     /// Returns pending and dead-letter counts and the age of the oldest waiting message for

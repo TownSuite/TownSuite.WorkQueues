@@ -58,4 +58,11 @@ public sealed class Fault<T>
     /// delivery attempt threw or did not complete.
     /// </summary>
     public bool IsRedelivery { get; init; }
+
+    /// <summary>
+    /// <see langword="true"/> when the message was dead-lettered without being delivered because
+    /// its <see cref="PublishOptions.ExpiresAt"/> passed. <see cref="ExceptionType"/> is then
+    /// <see cref="MessageExpiredException"/>.
+    /// </summary>
+    public bool Expired { get; init; }
 }

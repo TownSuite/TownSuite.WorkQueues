@@ -1,7 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <TargetFramework>net10.0</TargetFramework>
+        <!-- Tests and benchmarks still cover the legacy work queue API. -->
+        <NoWarn>$(NoWarn);TSWQ001</NoWarn>
+        <!-- The libraries ship for both; test both. -->
+        <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
 
         <IsPackable>false</IsPackable>
     </PropertyGroup>
@@ -33,6 +36,7 @@
     </ItemGroup>
 
     <ItemGroup>
+      <ProjectReference Include="..\TownSuite.WorkQueues.HealthChecks\TownSuite.WorkQueues.HealthChecks.csproj" />
       <ProjectReference Include="..\TownSuite.WorkQueues.Postgres\TownSuite.WorkQueues.Postgres.csproj" />
       <ProjectReference Include="..\TownSuite.WorkQueues.Redis\TownSuite.WorkQueues.Redis.csproj" />
       <ProjectReference Include="..\TownSuite.WorkQueues.Sqlite\TownSuite.WorkQueues.Sqlite.csproj" />
