@@ -87,6 +87,8 @@ public class MessageBusDeliveryControlTests
             "Released messages are pending, not dead-lettered or completed.");
         bus.Subscribe(next);
         await WaitFor(() => next.Count >= expected, timeoutMs: 10000);
+        // A consumer runs inside its span; the span ends only after the outcome is recorded.
+        await WaitFor(() => spans.Process.Count >= expected, timeoutMs: 10000);
 
         Assert.That(next.Count, Is.EqualTo(expected), "Released messages are delivered again at once.");
         var attempts = spans.Process.Select(s => s.GetTagItem("townsuite.workqueues.delivery_attempt")).ToList();
@@ -113,6 +115,8 @@ public class MessageBusDeliveryControlTests
         }
 
         await WaitFor(() => consumer.Seen.Count >= 2, timeoutMs: 10000);
+        // A consumer runs inside its span; the span ends only after the outcome is recorded.
+        await WaitFor(() => spans.ProcessFor(messageId).Count >= 2, timeoutMs: 10000);
         var publish = spans.Publish.Single(s => (string?)s.GetTagItem("messaging.message.id") == messageId.ToString());
         Assert.That(publish.TraceId, Is.EqualTo(requestTrace), "The publish span joins the caller's trace.");
         Assert.That(publish.Kind, Is.EqualTo(ActivityKind.Producer));
@@ -135,6 +139,7 @@ public class MessageBusDeliveryControlTests
         consumer.FailTimes = int.MaxValue;
         var dead = await bus.Publish(Order("replayed"), new PublishOptions());
         await WaitFor(async () => (await bus.GetQueueStatistics<OrderSubmitted>()).DeadLetteredCount == 1, timeoutMs: 10000);
+        await WaitFor(() => spans.ProcessFor(dead).Count >= 2, timeoutMs: 10000);
         var deadTrace = spans.ProcessFor(dead)[0].TraceId;
 
         consumer.Seen.Clear();
