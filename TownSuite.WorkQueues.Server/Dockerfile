@@ -1,6 +1,6 @@
 # Build from the repository root:
 #   docker buildx build -f TownSuite.WorkQueues.Server/Dockerfile .
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS base
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-resolute-chiseled-extra AS base
 WORKDIR /app
 EXPOSE 8080
 ENV ASPNETCORE_HTTP_PORTS=8080
