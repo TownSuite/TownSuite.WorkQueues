@@ -233,7 +233,8 @@ public class MessageBusDeliveryControlTests
         Assert.That((await bus.GetQueueStatistics<OrderSubmitted>()).PendingCount, Is.EqualTo(count));
 
         bus.Subscribe(consumer);
-        await WaitFor(() => consumer.Names.Count >= count, timeoutMs: 30000);
+        // Consuming is not what is under test; allow slow CI disks (SQLite completes one row per write).
+        await WaitFor(() => consumer.Names.Count >= count, timeoutMs: Math.Max(30000, count * 50));
         Assert.That(consumer.Names, Is.EqualTo(names), "Delivered in input order.");
         Assert.That(consumer.Ids, Is.EqualTo(ids), "Ids are returned in input order.");
     }
@@ -297,7 +298,8 @@ public class MessageBusDeliveryControlTests
     [Test] public Task Sqlite_SizeGuard() => WithSqlite(AssertSizeGuard);
     [Test] public Task Sqlite_RateLimit() => WithSqlite(AssertRateLimit);
     [Test] public Task Sqlite_Priority() => WithSqlite(AssertPriority);
-    [Test] public Task Sqlite_BatchPublish() => WithSqlite(f => AssertBatchPublish(f, 1500));
+    // SQLite inserts row by row in one transaction, so there is no chunk boundary to cross.
+    [Test] public Task Sqlite_BatchPublish() => WithSqlite(f => AssertBatchPublish(f, 300));
 
     [Test]
     public Task Sqlite_TransactionalBatch() => WithSqlite(f =>
