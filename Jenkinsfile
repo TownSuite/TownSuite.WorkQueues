@@ -53,6 +53,25 @@ pipeline {
                         }
                     }
                 }
+                stage('Performance') {
+                    options {
+                        timeout(time: 20, unit: 'MINUTES')
+                    }
+                    steps {
+                        // Fails the build when a scenario falls outside
+                        // TownSuite.WorkQueues.Server.LoadTest/baseline.json.
+                        sh "${env.WORKSPACE}/run_loadtest.sh"
+                    }
+                    post {
+                        always {
+                            script {
+                                if (fileExists('build/loadtest/report.json')) {
+                                    townsuite.archiveWithRetryAndLock('build/loadtest/report.json', 3)
+                                }
+                            }
+                        }
+                    }
+                }
                 stage('Code Sign') {
                     when {
                         expression { return env.BRANCH_NAME.startsWith('PR-') == false }

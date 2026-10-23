@@ -25,6 +25,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TownSuite.WorkQueues.Server
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TownSuite.WorkQueues.Server.Testing", "TownSuite.WorkQueues.Server.Testing\TownSuite.WorkQueues.Server.Testing.csproj", "{8B599C63-A00F-455A-A9ED-8F4ECA1DDCC8}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TownSuite.WorkQueues.Server.LoadTest", "TownSuite.WorkQueues.Server.LoadTest\TownSuite.WorkQueues.Server.LoadTest.csproj", "{9450FB0E-1AAA-4501-B26C-3BFA015602BF}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -167,6 +169,18 @@ Global
 		{8B599C63-A00F-455A-A9ED-8F4ECA1DDCC8}.Release|x64.Build.0 = Release|Any CPU
 		{8B599C63-A00F-455A-A9ED-8F4ECA1DDCC8}.Release|x86.ActiveCfg = Release|Any CPU
 		{8B599C63-A00F-455A-A9ED-8F4ECA1DDCC8}.Release|x86.Build.0 = Release|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Debug|x64.Build.0 = Debug|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Debug|x86.Build.0 = Debug|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Release|x64.ActiveCfg = Release|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Release|x64.Build.0 = Release|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Release|x86.ActiveCfg = Release|Any CPU
+		{9450FB0E-1AAA-4501-B26C-3BFA015602BF}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

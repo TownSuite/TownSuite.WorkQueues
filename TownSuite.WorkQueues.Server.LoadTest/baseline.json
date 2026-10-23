@@ -1,0 +1,41 @@
+{
+  "description": "Performance floor for TownSuite.WorkQueues.Server on the redis backend (Valkey 8.1). run_loadtest.sh runs every scenario with the server and Valkey limited to 2 CPUs and 1 GB each; a result outside these thresholds fails the build. Set on 2026-10-23 at about 50% of the throughput and 4x the p99 latency measured on a developer laptop. Tighten from the reports Jenkins archives (build/loadtest/report.json); loosen only with a reason in the commit message.",
+  "scenarios": [
+    {
+      "name": "steady",
+      "publishers": 4,
+      "subscriptions": 2,
+      "receiversPerSubscription": 16,
+      "durationSeconds": 30,
+      "payloadBytes": 512,
+      "maxPerReceive": 100,
+      "thresholds": {
+        "minPublishedPerSecond": 1800,
+        "minDeliveredPerSecond": 3600,
+        "maxPublishP99Ms": 100,
+        "maxEndToEndP99Ms": 300,
+        "maxMissing": 0,
+        "maxDuplicates": 0,
+        "maxErrors": 0
+      }
+    },
+    {
+      "name": "fanout",
+      "publishers": 1,
+      "subscriptions": 10,
+      "receiversPerSubscription": 4,
+      "durationSeconds": 30,
+      "payloadBytes": 512,
+      "maxPerReceive": 100,
+      "thresholds": {
+        "minPublishedPerSecond": 450,
+        "minDeliveredPerSecond": 4500,
+        "maxPublishP99Ms": 100,
+        "maxEndToEndP99Ms": 300,
+        "maxMissing": 0,
+        "maxDuplicates": 0,
+        "maxErrors": 0
+      }
+    }
+  ]
+}
