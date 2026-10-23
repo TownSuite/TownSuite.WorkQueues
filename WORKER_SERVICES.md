@@ -34,12 +34,25 @@ they are constructed. To integrate cleanly with ASP.NET Core's hosted service li
    not in a constructor or at registration time. This guarantees the bus starts *after* the
    migrations hosted service has finished running.
 
-2. **Stop on shutdown** — every bus implements `IAsyncDisposable`. Calling `DisposeAsync` cancels
-   the polling loops and waits up to 10 seconds for in-flight dispatches to complete. (The buses do
-   not implement `IDisposable`, so `(bus as IDisposable)?.Dispose()` silently does nothing.)
+2. **Drain on shutdown** — `DrainAsync(timeout, token)` stops the bus claiming new work, lets the
+   message each polling loop is consuming finish, and puts the rest of the claimed batch straight
+   back on the queue. If the timeout passes first, consumers' `ConsumeContext.CancellationToken` is
+   cancelled and their messages are released without counting an attempt. `DisposeAsync` drains
+   for `BatchOptions.DrainTimeout` (default 30 s) and then releases resources. (The buses do not
+   implement `IDisposable`, so `(bus as IDisposable)?.Dispose()` silently does nothing.)
 
 The pattern below wraps both concerns in a single `MessageBusHostedService` that every
-example in this guide reuses.
+example in this guide reuses. Keep the drain timeout below the host's shutdown timeout
+(`HostOptions.ShutdownTimeout`, 30 s by default), and that below the platform's kill timeout
+(Kubernetes `terminationGracePeriodSeconds`, also 30 s by default):
+
+```csharp
+builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(30));
+```
+
+Consumers should pass `context.CancellationToken` to the I/O they do, so a drain that runs out of time
+stops them promptly. A consumer that ignores it keeps its message until the claim lease expires or
+the claim transaction ends, and then the message is delivered again.
 
 ```csharp
 // Infrastructure/MessageBusHostedService.cs
@@ -60,7 +73,11 @@ internal sealed class MessageBusHostedService : IHostedService
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
-        if (_bus != null) await _bus.DisposeAsync();
+        if (_bus == null) return;
+        // Let in-flight messages finish. cancellationToken fires when the host's ShutdownTimeout
+        // runs out, which cuts the drain short and cancels the consumers.
+        await _bus.DrainAsync(TimeSpan.FromSeconds(25), cancellationToken);
+        await _bus.DisposeAsync();
     }
 }
 ```
@@ -169,7 +186,11 @@ internal sealed class MessageBusHostedService : IHostedService
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
-        if (_bus != null) await _bus.DisposeAsync();
+        if (_bus == null) return;
+        // Let in-flight messages finish. cancellationToken fires when the host's ShutdownTimeout
+        // runs out, which cuts the drain short and cancels the consumers.
+        await _bus.DrainAsync(TimeSpan.FromSeconds(25), cancellationToken);
+        await _bus.DisposeAsync();
     }
 }
 ```
@@ -527,6 +548,14 @@ public async Task PlaceOrderAsync(PlaceOrderRequest req, CancellationToken ct)
 }
 ```
 
+To publish many messages at once, use `PublishBatch`: one round trip on PostgreSQL (SQL Server
+inserts 1,000 rows per statement), all or none, delivered in the order given. It also takes a
+connection and transaction:
+
+```csharp
+await _bus.PublishBatch(invoices.Select(i => new InvoiceDue { InvoiceId = i.Id }), cn, tx);
+```
+
 With Entity Framework Core, use `db.Database.GetDbConnection()` and
 `db.Database.CurrentTransaction!.GetDbTransaction()` inside `BeginTransactionAsync`. On Redis, pass an
 `ITransaction` instead: `redisBus.Publish(message, transaction)`. See
@@ -557,7 +586,17 @@ services.AddSingleton(new SqlServerTransportOptions
     IsRetryable            = ex => ex is not ValidationException,
 
     // Faults are delivered at least once; one that throws is redelivered after this delay.
-    FaultRedeliveryDelay = TimeSpan.FromMinutes(1)
+    FaultRedeliveryDelay = TimeSpan.FromMinutes(1),
+
+    // Shutdown: how long DisposeAsync lets in-flight messages finish.
+    DrainTimeout = TimeSpan.FromSeconds(25),
+
+    // Reject runaway payloads at publish (MessageTooLargeException) instead of storing them.
+    MaxMessageSize = 256 * 1024,
+
+    // Protect a rate-limited downstream API: at most 5 deliveries a second from this bus
+    // (per replica: three replicas deliver up to 15 a second).
+    MessagesPerSecond = 5
 });
 
 services.AddSqlServerMigrationHostedService();
@@ -607,6 +646,14 @@ await bus.Publish(new CartHoldRequested { CartId = cartId },
     new PublishOptions { TimeToLive = TimeSpan.FromMinutes(10) });
 ```
 
+To get urgent messages past a backlog of the same type, publish them with a lower priority value
+(`0` is the default; lower is delivered first). Priority is supported on PostgreSQL, SQL Server and
+SQLite; Redis throws `NotSupportedException` for a non-zero priority:
+
+```csharp
+await bus.Publish(new ReceiptRequested { PaymentId = id }, new PublishOptions { Priority = -10 });
+```
+
 > Keep `MaxConcurrency = 1` (and no lease) when a channel needs strict ordering. Without
 > `ClaimLease`, keep `MaxBatchSize = 1` for consumers that call external services: the claimed batch
 > holds its transaction until every message in it is handled.
@@ -628,9 +675,16 @@ app.MapHealthChecks("/healthz");
 
 // Metrics: counters and the consumer-duration histogram are always emitted; TrackQueue adds
 // backlog gauges, refreshed in the background.
+// Tracing: a publish span, and a consume span per delivery whose parent is the publish span, so a
+// request and the work it queued are one trace. The trace context is stored with the message.
 builder.Services.AddOpenTelemetry()
-    .WithMetrics(m => m.AddMeter(WorkQueueMetrics.MeterName).AddPrometheusExporter());
+    .WithMetrics(m => m.AddMeter(WorkQueueMetrics.MeterName).AddPrometheusExporter())
+    .WithTracing(t => t.AddSource(WorkQueueTracing.ActivitySourceName).AddOtlpExporter());
 ```
+
+Consume spans carry `messaging.system`, `messaging.destination.name`, `messaging.message.id`,
+`townsuite.workqueues.delivery_attempt` and `townsuite.workqueues.outcome` (`processed`, `retried`,
+`deadlettered`, `expired` or `released`), and record the consumer's exception.
 
 Queue gauges and purging both fit in one small hosted service:
 
@@ -811,8 +865,8 @@ journalctl -u order-processor -f   # tail logs
 ```
 
 Both `UseWindowsService()` and `UseSystemd()` wire up graceful shutdown signals so
-`IHostedService.StopAsync` is called correctly, giving the bus time to finish in-flight
-dispatches before the process exits.
+`IHostedService.StopAsync` is called correctly, giving the bus time to drain in-flight
+messages before the process exits.
 
 ---
 
@@ -840,7 +894,9 @@ When asked to add message bus processing to a Worker Service or ASP.NET Core app
    a connection string (one multiplexer per process). Then register `RedisOptions` and the bus.
 
 6. **Wire `MessageBusHostedService`** — resolve `IMessageBus` inside `StartAsync`, not in
-   the constructor. `await bus.DisposeAsync()` in `StopAsync` (the buses are `IAsyncDisposable` only).
+   the constructor. In `StopAsync`, `await bus.DrainAsync(timeout, cancellationToken)` then
+   `await bus.DisposeAsync()` (the buses are `IAsyncDisposable` only). Pass
+   `context.CancellationToken` through consumers' I/O so a drain can stop them.
 
 7. **Register all consumer classes in DI** (`AddTransient<TConsumer>`) so their own
    dependencies (loggers, `IServiceScopeFactory`, etc.) are injected.
@@ -870,3 +926,9 @@ When asked to add message bus processing to a Worker Service or ASP.NET Core app
 
 15. **Add the health check and a purge job** (`AddMessageBus`, `PurgeProcessed`) so stopped workers,
     growing backlogs and unbounded tables are noticed.
+
+16. **Add `WorkQueueTracing.ActivitySourceName` to the tracer** wherever OpenTelemetry tracing is
+    configured, on both the publishing and the consuming side.
+
+17. **Use `PublishBatch` for bulk producers**, `MessagesPerSecond` for consumers of rate-limited
+    APIs, and `MaxMessageSize` to catch payloads that should have been references.

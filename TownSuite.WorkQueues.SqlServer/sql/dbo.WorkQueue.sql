@@ -16,6 +16,8 @@ BEGIN
         [expiresat]        DATETIME         NULL,
         [lockeduntil]      DATETIME         NULL,
         [locktoken]        UNIQUEIDENTIFIER NULL,
+        [priority]         INT              NOT NULL CONSTRAINT [DF_workqueue_priority] DEFAULT (0),
+        [tracecontext]     NVARCHAR(1000)   NULL,
         CONSTRAINT [PK_workqueue] PRIMARY KEY CLUSTERED ([id] ASC)
     )
 END
@@ -106,6 +108,25 @@ BEGIN
     ALTER TABLE [dbo].[workqueue] ADD [locktoken] UNIQUEIDENTIFIER NULL
 END
 GO
+-- Add priority column if upgrading from a schema that pre-dates it.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[workqueue]') AND name = N'priority'
+)
+BEGIN
+    ALTER TABLE [dbo].[workqueue]
+        ADD [priority] INT NOT NULL CONSTRAINT [DF_workqueue_priority_add] DEFAULT (0)
+END
+GO
+-- Add tracecontext column if upgrading from a schema that pre-dates it.
+IF NOT EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID(N'[dbo].[workqueue]') AND name = N'tracecontext'
+)
+BEGIN
+    ALTER TABLE [dbo].[workqueue] ADD [tracecontext] NVARCHAR(1000) NULL
+END
+GO
 -- Widen channel column if upgrading from nvarchar(50).
 IF EXISTS (
     SELECT 1 FROM sys.columns
@@ -126,6 +147,19 @@ IF NOT EXISTS (
 BEGIN
     CREATE NONCLUSTERED INDEX [IX_workqueue_channel_unprocessed]
     ON [dbo].[workqueue] ([channel] ASC, [timecreatedutc] ASC)
+    WHERE ([timeprocessedutc] IS NULL AND [failedat] IS NULL)
+END
+GO
+-- Filtered index matching the message bus claim order: priority, then oldest first, then
+-- insertion order (the clustered key, [id], is part of every nonclustered index).
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_workqueue_channel_priority_unprocessed'
+      AND object_id = OBJECT_ID(N'[dbo].[workqueue]')
+)
+BEGIN
+    CREATE NONCLUSTERED INDEX [IX_workqueue_channel_priority_unprocessed]
+    ON [dbo].[workqueue] ([channel] ASC, [priority] ASC, [timecreatedutc] ASC)
     WHERE ([timeprocessedutc] IS NULL AND [failedat] IS NULL)
 END
 GO

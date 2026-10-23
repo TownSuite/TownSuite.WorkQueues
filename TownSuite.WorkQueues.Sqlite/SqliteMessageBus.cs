@@ -49,13 +49,14 @@ public class SqliteMessageBus : MessageBusBase
 
     // ── Publishing ──────────────────────────────────────────────────────────
 
-    /// <inheritdoc />
+    private protected override bool SupportsTransactionalPublish => true;
+
     /// <remarks>
     /// <paramref name="connection"/> must be a <see cref="SqliteConnection"/> to the file the bus
     /// polls and <paramref name="transaction"/> (when supplied) a <see cref="SqliteTransaction"/> on it.
     /// </remarks>
-    public override async Task<Guid> Publish<T>(T message, DbConnection connection, DbTransaction? transaction,
-        PublishOptions? options = null, CancellationToken cancellationToken = default)
+    private protected override async Task InsertAsync(DbConnection connection, DbTransaction? transaction,
+        IReadOnlyList<OutgoingMessage> messages, CancellationToken cancellationToken)
     {
         if (connection is not SqliteConnection sqliteConnection)
             throw new ArgumentException("connection must be a SqliteConnection", nameof(connection));
@@ -65,36 +66,51 @@ public class SqliteMessageBus : MessageBusBase
         if (sqliteConnection.State == ConnectionState.Closed)
             await sqliteConnection.OpenAsync(cancellationToken);
 
-        var channel = ChannelName<T>();
-        var messageId = Guid.NewGuid();
-        await InsertAsync(sqliteConnection, transaction as SqliteTransaction, channel, JsonSerializer.Serialize(message),
-            messageId, options ?? new PublishOptions(), cancellationToken);
-        RecordPublished(channel);
-        return messageId;
+        await InsertAsync(sqliteConnection, transaction as SqliteTransaction, messages, cancellationToken);
     }
 
-    private protected override async Task InsertAsync(string channel, string payload, Guid messageId,
-        PublishOptions options, CancellationToken cancellationToken)
+    private protected override async Task InsertAsync(IReadOnlyList<OutgoingMessage> messages, CancellationToken cancellationToken)
     {
         await using var conn = await OpenConnectionAsync(cancellationToken);
-        await InsertAsync(conn, null, channel, payload, messageId, options, cancellationToken);
+        await InsertAsync(conn, null, messages, cancellationToken);
     }
 
-    private static async Task InsertAsync(SqliteConnection conn, SqliteTransaction? tran, string channel, string payload,
-        Guid messageId, PublishOptions options, CancellationToken cancellationToken)
+    // SQLite runs in-process, so a batch is one prepared INSERT executed per row inside a
+    // transaction (the caller's, or one of its own for more than one row).
+    private static async Task InsertAsync(SqliteConnection conn, SqliteTransaction? tran, IReadOnlyList<OutgoingMessage> messages,
+        CancellationToken cancellationToken)
     {
-        await using var cmd = conn.CreateCommand();
-        cmd.Transaction = tran;
-        cmd.CommandText = """
-            INSERT INTO workqueue(channel, payload, messageid, scheduledfor, expiresat)
-            VALUES(@channel, @payload, @messageid, @scheduledfor, @expiresat)
-            """;
-        cmd.Parameters.AddWithValue("@channel",      channel);
-        cmd.Parameters.AddWithValue("@payload",      payload);
-        cmd.Parameters.AddWithValue("@messageid",    messageId.ToString());
-        cmd.Parameters.AddWithValue("@scheduledfor", DateValue(options.DeliverAfter?.UtcDateTime));
-        cmd.Parameters.AddWithValue("@expiresat",    DateValue(options.ExpiresAt?.UtcDateTime));
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+        var first = messages[0];
+        var ownTran = tran == null && messages.Count > 1 ? conn.BeginTransaction() : null;
+        try
+        {
+            await using var cmd = conn.CreateCommand();
+            cmd.Transaction = tran ?? ownTran;
+            cmd.CommandText = """
+                INSERT INTO workqueue(channel, payload, messageid, scheduledfor, expiresat, priority, tracecontext)
+                VALUES(@channel, @payload, @messageid, @scheduledfor, @expiresat, @priority, @tracecontext)
+                """;
+            cmd.Parameters.AddWithValue("@channel",      first.Channel);
+            cmd.Parameters.AddWithValue("@scheduledfor", DateValue(first.Options.DeliverAfter?.UtcDateTime));
+            cmd.Parameters.AddWithValue("@expiresat",    DateValue(first.Options.ExpiresAt?.UtcDateTime));
+            cmd.Parameters.AddWithValue("@priority",     first.Options.Priority);
+            cmd.Parameters.AddWithValue("@tracecontext", (object?)first.TraceContext ?? DBNull.Value);
+            var payload   = cmd.Parameters.Add("@payload",   SqliteType.Text);
+            var messageId = cmd.Parameters.Add("@messageid", SqliteType.Text);
+
+            foreach (var message in messages)
+            {
+                payload.Value   = message.Payload;
+                messageId.Value = message.MessageId.ToString();
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            if (ownTran != null) await ownTran.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            if (ownTran != null) await ownTran.DisposeAsync();
+        }
     }
 
     // ── Claiming ────────────────────────────────────────────────────────────
@@ -123,7 +139,7 @@ public class SqliteMessageBus : MessageBusBase
                           AND (lockeduntil IS NULL OR lockeduntil < @now)
                           AND (scheduledfor IS NULL OR scheduledfor <= @now)
                           AND channel IN ({inClause})
-                        ORDER BY timecreatedutc
+                        ORDER BY priority, timecreatedutc, id
                         LIMIT @maxMessages
                     )
                     """;
@@ -141,10 +157,10 @@ public class SqliteMessageBus : MessageBusBase
             await using (var fetchCmd = conn.CreateCommand())
             {
                 fetchCmd.CommandText = """
-                    SELECT id, channel, payload, retrycount, messageid, timecreatedutc, expiresat
+                    SELECT id, channel, payload, retrycount, messageid, timecreatedutc, expiresat, priority, tracecontext
                     FROM workqueue
                     WHERE locktoken = @locktoken
-                    ORDER BY timecreatedutc
+                    ORDER BY priority, timecreatedutc, id
                     """;
                 fetchCmd.Parameters.AddWithValue("@locktoken", lockToken);
 
@@ -159,7 +175,9 @@ public class SqliteMessageBus : MessageBusBase
                         RetryCount     = reader.GetInt32(3),
                         MessageId      = Guid.Parse(reader.GetString(4)),
                         TimeCreatedUtc = ParseSqliteDateTime(reader.GetString(5)).UtcDateTime,
-                        ExpiresAtUtc   = reader.IsDBNull(6) ? null : ParseSqliteDateTime(reader.GetString(6)).UtcDateTime
+                        ExpiresAtUtc   = reader.IsDBNull(6) ? null : ParseSqliteDateTime(reader.GetString(6)).UtcDateTime,
+                        Priority       = reader.GetInt32(7),
+                        TraceContext   = reader.IsDBNull(8) ? null : reader.GetString(8)
                     });
                 }
             }
@@ -217,6 +235,17 @@ public class SqliteMessageBus : MessageBusBase
             cmd.Parameters.AddWithValue("@failedat",     outcome.DeadLetter ? ToSqliteDateTime(DateTime.UtcNow) : DBNull.Value);
             cmd.Parameters.AddWithValue("@scheduledfor", DateValue(outcome.ScheduledForUtc));
             cmd.Parameters.AddWithValue("@lasterror",    outcome.Error.ToJson());
+            await ExecuteAsync(cmd, message);
+        }
+
+        public override async Task ReleaseAsync(MessageDto message)
+        {
+            await using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE workqueue
+                SET lockeduntil = NULL, locktoken = NULL
+                WHERE id = @id AND locktoken = @locktoken
+                """;
             await ExecuteAsync(cmd, message);
         }
 

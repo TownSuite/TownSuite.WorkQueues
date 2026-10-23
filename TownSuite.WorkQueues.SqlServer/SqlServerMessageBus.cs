@@ -33,13 +33,18 @@ public class SqlServerMessageBus : MessageBusBase
 
     // ── Publishing ──────────────────────────────────────────────────────────
 
-    /// <inheritdoc />
+    // A multi-row VALUES list takes at most 1000 rows; two parameters per row also stays
+    // under SQL Server's 2100-parameter limit.
+    private const int InsertChunkSize = 1000;
+
+    private protected override bool SupportsTransactionalPublish => true;
+
     /// <remarks>
     /// <paramref name="connection"/> must be a <see cref="SqlConnection"/> to the database the bus
     /// polls and <paramref name="transaction"/> (when supplied) a <see cref="SqlTransaction"/> on it.
     /// </remarks>
-    public override async Task<Guid> Publish<T>(T message, DbConnection connection, DbTransaction? transaction,
-        PublishOptions? options = null, CancellationToken cancellationToken = default)
+    private protected override async Task InsertAsync(DbConnection connection, DbTransaction? transaction,
+        IReadOnlyList<OutgoingMessage> messages, CancellationToken cancellationToken)
     {
         if (connection is not SqlConnection sqlConnection)
             throw new ArgumentException("connection must be a SqlConnection", nameof(connection));
@@ -49,34 +54,58 @@ public class SqlServerMessageBus : MessageBusBase
         if (sqlConnection.State == ConnectionState.Closed)
             await sqlConnection.OpenAsync(cancellationToken);
 
-        var channel = ChannelName<T>();
-        var messageId = Guid.NewGuid();
-        await InsertAsync(sqlConnection, transaction as SqlTransaction, channel, JsonSerializer.Serialize(message),
-            messageId, options ?? new PublishOptions(), cancellationToken);
-        RecordPublished(channel);
-        return messageId;
+        await InsertAsync(sqlConnection, transaction as SqlTransaction, messages, cancellationToken);
     }
 
-    private protected override async Task InsertAsync(string channel, string payload, Guid messageId,
-        PublishOptions options, CancellationToken cancellationToken)
+    private protected override async Task InsertAsync(IReadOnlyList<OutgoingMessage> messages, CancellationToken cancellationToken)
     {
         await using var conn = new SqlConnection(_options.ConnectionString);
         await conn.OpenAsync(cancellationToken);
-        await InsertAsync(conn, null, channel, payload, messageId, options, cancellationToken);
+        await InsertAsync(conn, null, messages, cancellationToken);
     }
 
-    private async Task InsertAsync(SqlConnection conn, SqlTransaction? tran, string channel, string payload,
-        Guid messageId, PublishOptions options, CancellationToken cancellationToken)
+    // One INSERT per chunk of rows. Several chunks without a caller transaction run in a
+    // transaction of their own, so a batch is published all or none either way.
+    private async Task InsertAsync(SqlConnection conn, SqlTransaction? tran, IReadOnlyList<OutgoingMessage> messages,
+        CancellationToken cancellationToken)
     {
+        SqlTransaction? ownTran = tran == null && messages.Count > InsertChunkSize ? conn.BeginTransaction() : null;
+        try
+        {
+            for (int offset = 0; offset < messages.Count; offset += InsertChunkSize)
+                await InsertChunkAsync(conn, tran ?? ownTran, messages, offset,
+                    Math.Min(InsertChunkSize, messages.Count - offset), cancellationToken);
+
+            if (ownTran != null) await ownTran.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            if (ownTran != null) await ownTran.DisposeAsync();
+        }
+    }
+
+    // Identity values follow the ORDER BY of an INSERT ... SELECT, so rows keep input order.
+    private async Task InsertChunkAsync(SqlConnection conn, SqlTransaction? tran, IReadOnlyList<OutgoingMessage> messages,
+        int offset, int count, CancellationToken cancellationToken)
+    {
+        var first = messages[offset];
+        var values = string.Join(", ", Enumerable.Range(0, count).Select(i => $"({i}, @p{i}, @m{i})"));
         await using var cmd = new SqlCommand($"""
-            INSERT INTO {Table} ([channel], [payload], [messageid], [scheduledfor], [expiresat])
-            VALUES (@channel, @payload, @messageid, @scheduledfor, @expiresat)
+            INSERT INTO {Table} ([channel], [payload], [messageid], [scheduledfor], [expiresat], [priority], [tracecontext])
+            SELECT @channel, v.[payload], v.[messageid], @scheduledfor, @expiresat, @priority, @tracecontext
+            FROM (VALUES {values}) AS v([ord], [payload], [messageid])
+            ORDER BY v.[ord]
             """, conn, tran);
-        cmd.Parameters.AddWithValue("@channel", channel);
-        cmd.Parameters.AddWithValue("@payload", payload);
-        cmd.Parameters.AddWithValue("@messageid", messageId);
-        cmd.Parameters.Add(DateTimeParam("@scheduledfor", options.DeliverAfter?.UtcDateTime));
-        cmd.Parameters.Add(DateTimeParam("@expiresat", options.ExpiresAt?.UtcDateTime));
+        cmd.Parameters.AddWithValue("@channel", first.Channel);
+        cmd.Parameters.Add(DateTimeParam("@scheduledfor", first.Options.DeliverAfter?.UtcDateTime));
+        cmd.Parameters.Add(DateTimeParam("@expiresat", first.Options.ExpiresAt?.UtcDateTime));
+        cmd.Parameters.AddWithValue("@priority", first.Options.Priority);
+        cmd.Parameters.Add(new SqlParameter("@tracecontext", SqlDbType.NVarChar, 1000) { Value = (object?)first.TraceContext ?? DBNull.Value });
+        for (int i = 0; i < count; i++)
+        {
+            cmd.Parameters.Add(new SqlParameter($"@p{i}", SqlDbType.NVarChar, -1) { Value = messages[offset + i].Payload });
+            cmd.Parameters.AddWithValue($"@m{i}", messages[offset + i].MessageId);
+        }
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -102,7 +131,7 @@ public class SqlServerMessageBus : MessageBusBase
               AND ([scheduledfor] IS NULL OR [scheduledfor] <= GETUTCDATE())
               AND ([lockeduntil] IS NULL OR [lockeduntil] < GETUTCDATE())
               AND [channel] IN ({inClause})
-            ORDER BY [timecreatedutc]
+            ORDER BY [priority], [timecreatedutc], [id]
             """;
 
         var conn = new SqlConnection(_options.ConnectionString);
@@ -118,7 +147,8 @@ public class SqlServerMessageBus : MessageBusBase
                     UPDATE due
                     SET [lockeduntil] = DATEADD(millisecond, @leaseMs, GETUTCDATE()), [locktoken] = @token
                     OUTPUT inserted.[id], inserted.[channel], inserted.[payload], inserted.[retrycount],
-                           inserted.[messageid], inserted.[timecreatedutc], inserted.[expiresat]
+                           inserted.[messageid], inserted.[timecreatedutc], inserted.[expiresat],
+                           inserted.[priority], inserted.[tracecontext]
                     """, conn);
                 AddClaimParameters(cmd, channels, maxMessages);
                 cmd.Parameters.AddWithValue("@leaseMs", (int)Math.Min(int.MaxValue, lease.TotalMilliseconds));
@@ -130,7 +160,8 @@ public class SqlServerMessageBus : MessageBusBase
             {
                 var tran = conn.BeginTransaction();
                 await using var cmd = new SqlCommand($"""
-                    SELECT [id], [channel], [payload], [retrycount], [messageid], [timecreatedutc], [expiresat]
+                    SELECT [id], [channel], [payload], [retrycount], [messageid], [timecreatedutc], [expiresat],
+                           [priority], [tracecontext]
                     FROM ({due}) AS due
                     """, conn, tran);
                 AddClaimParameters(cmd, channels, maxMessages);
@@ -166,11 +197,13 @@ public class SqlServerMessageBus : MessageBusBase
                 RetryCount     = reader.GetInt32(3),
                 MessageId      = reader.GetGuid(4),
                 TimeCreatedUtc = reader.GetDateTime(5),
-                ExpiresAtUtc   = reader.IsDBNull(6) ? null : reader.GetDateTime(6)
+                ExpiresAtUtc   = reader.IsDBNull(6) ? null : reader.GetDateTime(6),
+                Priority       = reader.GetInt32(7),
+                TraceContext   = reader.IsDBNull(8) ? null : reader.GetString(8)
             });
         }
         // OUTPUT does not preserve the CTE's order.
-        return messages.OrderBy(m => m.TimeCreatedUtc).ThenBy(m => m.Id).ToList();
+        return messages.OrderBy(m => m.Priority).ThenBy(m => m.TimeCreatedUtc).ThenBy(m => m.Id).ToList();
     }
 
     private sealed class Batch : ClaimedBatch
@@ -219,6 +252,19 @@ public class SqlServerMessageBus : MessageBusBase
             cmd.Parameters.AddWithValue("@deadLetter", outcome.DeadLetter);
             cmd.Parameters.Add(DateTimeParam("@scheduledFor", outcome.ScheduledForUtc));
             cmd.Parameters.AddWithValue("@lastError", outcome.Error.ToJson());
+            await ExecuteAsync(cmd, message);
+        }
+
+        public override async Task ReleaseAsync(MessageDto message)
+        {
+            // In transaction mode the row is untouched and the commit releases its lock.
+            if (!_leaseToken.HasValue) return;
+
+            await using var cmd = new SqlCommand($"""
+                UPDATE {_bus.Table}
+                SET [lockeduntil] = NULL, [locktoken] = NULL
+                WHERE [id] = @id{LeaseGuard}
+                """, _conn, _tran);
             await ExecuteAsync(cmd, message);
         }
 

@@ -44,6 +44,10 @@ public static class WorkQueueMetrics
     public static void RecordPublished(string transport, string channel) =>
         Published.Add(1, Tags(transport, channel));
 
+    /// <summary>Records <paramref name="count"/> messages published together.</summary>
+    public static void RecordPublished(string transport, string channel, long count) =>
+        Published.Add(count, Tags(transport, channel));
+
     /// <summary>Records a successful delivery and how long the consumers took.</summary>
     public static void RecordProcessed(string transport, string channel, TimeSpan elapsed)
     {

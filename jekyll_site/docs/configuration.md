@@ -18,6 +18,11 @@ All backend options classes inherit from `BatchOptions`, which controls polling 
 | `ContinuousPolling` | `bool` | `false` | When `true`, the bus polls again immediately after each batch instead of waiting `MaxWaitTime`. Useful for high-throughput scenarios. |
 | `MaxRetries` | `int` | `3` | Maximum delivery attempts before a message is dead-lettered. |
 | `RetryDelay` | `TimeSpan` | `0` | Time to hold a failed message before making it eligible for the next retry attempt. |
+| `DrainTimeout` | `TimeSpan` | `30s` | How long `DisposeAsync` lets in-flight messages finish before cancelling their consumers. See `IMessageBus.DrainAsync`. |
+| `MaxMessageSize` | `int?` | `null` | Largest serialised message in bytes. Larger messages throw `MessageTooLargeException` at publish, and are dead-lettered unread if found in the store. |
+| `MessagesPerSecond` | `double` | `0` | Maximum deliveries per second for this bus, across its polling loops. `0` is no limit. |
+
+Per-message options are set with `PublishOptions` on `Publish` and `PublishBatch`: `DeliverAfter`, `ExpiresAt` / `TimeToLive`, and `Priority` (lower is delivered first; not supported on Redis).
 
 ## PostgreSQL — `SqlTransportOptions`
 

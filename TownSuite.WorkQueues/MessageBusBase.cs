@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -10,8 +11,9 @@ namespace TownSuite.WorkQueues;
 /// <summary>
 /// Shared implementation of <see cref="IMessageBus"/> used by every built-in transport:
 /// subscriptions, the polling loops, dispatch, the retry / dead-letter decision, message
-/// expiry, at-least-once fault delivery and metrics. A transport supplies only the storage
-/// operations (claim, complete, fail, fault bookkeeping and queries).
+/// expiry, size and rate limits, draining, at-least-once fault delivery, metrics and tracing.
+/// A transport supplies only the storage operations (insert, claim, complete, fail, release,
+/// fault bookkeeping and queries).
 /// </summary>
 public abstract class MessageBusBase : IMessageBus
 {
@@ -21,9 +23,15 @@ public abstract class MessageBusBase : IMessageBus
     private readonly BatchOptions _batchOptions;
     private readonly IServiceProvider? _serviceProvider;
     private readonly string _transport;
+    private readonly MessageRateLimiter? _rateLimiter;
+    private readonly CancellationTokenSource _stopClaiming = new();
     private Task[] _pollingTasks = Array.Empty<Task>();
     private int _disposed;
 
+    /// <summary>
+    /// Cancelled when consumers must stop: the token they receive. Claiming stops earlier, when a
+    /// drain starts; this is cancelled only once the drain timeout passes.
+    /// </summary>
     private protected readonly CancellationTokenSource Cts = new();
     private protected readonly ILogger Logger;
 
@@ -34,6 +42,7 @@ public abstract class MessageBusBase : IMessageBus
         _serviceProvider = serviceProvider;
         _transport       = transport;
         _faultGate       = IntervalGate.ForFaultRedelivery(options);
+        _rateLimiter     = MessageRateLimiter.For(options);
     }
 
     /// <summary>
@@ -43,9 +52,15 @@ public abstract class MessageBusBase : IMessageBus
     private protected void StartPolling()
     {
         // Yield to the caller so Subscribe() calls made immediately after construction
-        // are registered before the first poll cycle runs.
+        // are registered before the first poll cycle runs. The loops must not inherit the
+        // constructing caller's activity, or every delivery would join that caller's trace.
         _pollingTasks = Enumerable.Range(0, Math.Max(1, _batchOptions.MaxConcurrency))
-            .Select(_ => Task.Run(async () => { await Task.Yield(); await PollAsync(); }))
+            .Select(_ => Task.Run(async () =>
+            {
+                Activity.Current = null;
+                await Task.Yield();
+                await PollAsync();
+            }))
             .ToArray();
     }
 
@@ -117,35 +132,94 @@ public abstract class MessageBusBase : IMessageBus
 
     /// <inheritdoc />
     public async Task Publish<T>(T message, CancellationToken cancellationToken = default) =>
-        await PublishAsync(message, PublishOptions.None, cancellationToken);
+        await Publish(message, PublishOptions.None, cancellationToken);
 
     /// <inheritdoc />
     public virtual async Task Publish<T>(T message, DateTimeOffset deliverAfter, CancellationToken cancellationToken = default) =>
-        await PublishAsync(message, new PublishOptions { DeliverAfter = deliverAfter }, cancellationToken);
+        await Publish(message, new PublishOptions { DeliverAfter = deliverAfter }, cancellationToken);
 
     /// <inheritdoc />
-    public Task<Guid> Publish<T>(T message, PublishOptions options, CancellationToken cancellationToken = default) =>
-        PublishAsync(message, options ?? PublishOptions.None, cancellationToken);
+    public async Task<Guid> Publish<T>(T message, PublishOptions options, CancellationToken cancellationToken = default) =>
+        (await PublishBatch(new[] { message }, options, cancellationToken))[0];
 
     /// <inheritdoc />
-    public virtual Task<Guid> Publish<T>(T message, DbConnection connection, DbTransaction? transaction,
-        PublishOptions? options = null, CancellationToken cancellationToken = default)
-        => throw new NotSupportedException($"{GetType().Name} does not support transactional publish.");
+    public Task<IReadOnlyList<Guid>> PublishBatch<T>(IEnumerable<T> messages, PublishOptions? options = null,
+        CancellationToken cancellationToken = default) =>
+        PublishCoreAsync(messages, options, batch => InsertAsync(batch, cancellationToken));
 
-    private async Task<Guid> PublishAsync<T>(T message, PublishOptions options, CancellationToken cancellationToken)
+    /// <inheritdoc />
+    public async Task<Guid> Publish<T>(T message, DbConnection connection, DbTransaction? transaction,
+        PublishOptions? options = null, CancellationToken cancellationToken = default) =>
+        (await PublishBatch(new[] { message }, connection, transaction, options, cancellationToken))[0];
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<Guid>> PublishBatch<T>(IEnumerable<T> messages, DbConnection connection,
+        DbTransaction? transaction, PublishOptions? options = null, CancellationToken cancellationToken = default)
     {
-        var channel = ChannelName<T>();
-        var messageId = Guid.NewGuid();
-        await InsertAsync(channel, JsonSerializer.Serialize(message), messageId, options, cancellationToken);
-        RecordPublished(channel);
-        return messageId;
+        ArgumentNullException.ThrowIfNull(connection);
+        if (!SupportsTransactionalPublish)
+            throw new NotSupportedException($"{GetType().Name} does not support transactional publish.");
+        return PublishCoreAsync(messages, options,
+            batch => InsertAsync(connection, transaction, batch, cancellationToken));
     }
 
-    private protected void RecordPublished(string channel) => WorkQueueMetrics.RecordPublished(_transport, channel);
+    /// <summary>
+    /// Serialises, checks and traces <paramref name="messages"/>, then stores them with
+    /// <paramref name="insert"/>. Every publish overload, in every transport, goes through here.
+    /// </summary>
+    private protected async Task<IReadOnlyList<Guid>> PublishCoreAsync<T>(IEnumerable<T> messages, PublishOptions? options,
+        Func<IReadOnlyList<OutgoingMessage>, Task> insert)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        options ??= PublishOptions.None;
+        ValidatePublishOptions(options);
 
-    /// <summary>Inserts a serialised message.</summary>
-    private protected abstract Task InsertAsync(string channel, string payload, Guid messageId,
-        PublishOptions options, CancellationToken cancellationToken);
+        var channel = ChannelName<T>();
+        var payloads = messages.Select(m => JsonSerializer.Serialize(m)).ToList();
+        if (payloads.Count == 0) return Array.Empty<Guid>();
+
+        if (_batchOptions.MaxMessageSize is { } maxSize)
+        {
+            foreach (var payload in payloads)
+                if (Encoding.UTF8.GetByteCount(payload) is var size && size > maxSize)
+                    throw new MessageTooLargeException(channel, size, maxSize);
+        }
+
+        using var activity = WorkQueueTracing.StartPublish(_transport, channel, payloads.Count);
+        var traceContext = WorkQueueTracing.CaptureContext(activity);
+        var outgoing = payloads.Select(p => new OutgoingMessage(channel, p, Guid.NewGuid(), options, traceContext)).ToArray();
+        if (outgoing.Length == 1) activity?.SetTag("messaging.message.id", outgoing[0].MessageId.ToString());
+
+        try
+        {
+            await insert(outgoing);
+        }
+        catch (Exception ex)
+        {
+            WorkQueueTracing.RecordException(activity, ex);
+            throw;
+        }
+
+        WorkQueueMetrics.RecordPublished(_transport, channel, outgoing.Length);
+        return outgoing.Select(m => m.MessageId).ToArray();
+    }
+
+    /// <summary>Throws for <see cref="PublishOptions"/> the transport cannot honour.</summary>
+    private protected virtual void ValidatePublishOptions(PublishOptions options) { }
+
+    /// <summary>Inserts serialised messages, all or none.</summary>
+    private protected abstract Task InsertAsync(IReadOnlyList<OutgoingMessage> messages, CancellationToken cancellationToken);
+
+    /// <summary>Whether the transport overrides the connection/transaction <c>InsertAsync</c>.</summary>
+    private protected virtual bool SupportsTransactionalPublish => false;
+
+    /// <summary>
+    /// Inserts serialised messages using the caller's connection and transaction (the outbox
+    /// pattern). Transports that set <see cref="SupportsTransactionalPublish"/> override it.
+    /// </summary>
+    private protected virtual Task InsertAsync(DbConnection connection, DbTransaction? transaction,
+        IReadOnlyList<OutgoingMessage> messages, CancellationToken cancellationToken) =>
+        throw new NotSupportedException($"{GetType().Name} does not support transactional publish.");
 
     // ── Queries and maintenance (transport-specific) ────────────────────────
 
@@ -172,22 +246,23 @@ public abstract class MessageBusBase : IMessageBus
 
     private async Task PollAsync()
     {
-        while (!Cts.Token.IsCancellationRequested)
+        var stopping = _stopClaiming.Token;
+        while (!stopping.IsCancellationRequested)
         {
             try
             {
                 int processed = await ProcessBatchAsync();
-                if (_faultGate.TryEnter())
+                if (!stopping.IsCancellationRequested && _faultGate.TryEnter())
                     processed += await RedeliverFaultsAsync();
 
                 if (processed == 0 && !_batchOptions.ContinuousPolling)
-                    await Task.Delay(_batchOptions.MaxWaitTime, Cts.Token);
+                    await Task.Delay(_batchOptions.MaxWaitTime, stopping);
             }
-            catch (OperationCanceledException) when (Cts.Token.IsCancellationRequested) { }
+            catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
             catch (Exception ex)
             {
                 Logger.LogError(ex, "Error in {Bus} polling loop", GetType().Name);
-                try { await Task.Delay(1000, Cts.Token); } catch (OperationCanceledException) { }
+                try { await Task.Delay(1000, stopping); } catch (OperationCanceledException) { }
             }
         }
     }
@@ -202,26 +277,69 @@ public abstract class MessageBusBase : IMessageBus
         var channels = SubscribedChannels;
         if (channels.Length == 0) return 0;
 
-        await using var batch = await ClaimAsync(channels, _batchOptions.MaxBatchSize, Cts.Token);
+        // With a rate limit, tokens for the whole claim are taken before claiming, so no claimed
+        // message waits for a token (and no lease runs down) unless the transport over-claims.
+        int maxMessages = _batchOptions.MaxBatchSize;
+        int prepaid = 0;
+        if (_rateLimiter != null)
+        {
+            await _rateLimiter.WaitAsync(_stopClaiming.Token);
+            prepaid = 1 + _rateLimiter.TryTake(maxMessages - 1);
+            maxMessages = prepaid;
+        }
+
+        ClaimedBatch claimed;
+        try
+        {
+            claimed = await ClaimAsync(channels, maxMessages, _stopClaiming.Token);
+        }
+        catch
+        {
+            _rateLimiter?.Return(prepaid);
+            throw;
+        }
+        await using var batch = claimed;
+        _rateLimiter?.Return(prepaid - Math.Min(prepaid, batch.Messages.Count));
 
         // Faults are delivered only after the batch's outcomes are durable, so a failed commit
         // never reports a dead-letter that did not happen.
         var faults = new List<FaultInfo>(batch.DeadLetteredDuringClaim);
+        bool draining = false;
 
-        foreach (var msg in batch.Messages)
+        for (int i = 0; i < batch.Messages.Count; i++)
         {
-            Exception? error = null;
-            var stopwatch = Stopwatch.StartNew();
+            var msg = batch.Messages[i];
 
-            if (msg.ExpiresAtUtc is { } expiresAt && expiresAt <= DateTime.UtcNow)
+            if (!draining && _rateLimiter != null && i >= prepaid)
             {
-                error = new MessageExpiredException(new DateTimeOffset(expiresAt, TimeSpan.Zero));
+                try { await _rateLimiter.WaitAsync(_stopClaiming.Token); }
+                catch (OperationCanceledException) { draining = true; }
             }
-            else
+
+            // Once a drain starts, messages not yet started go back to the queue untouched.
+            if (draining || _stopClaiming.IsCancellationRequested)
+            {
+                draining = true;
+                await batch.ReleaseAsync(msg);
+                continue;
+            }
+
+            using var activity = WorkQueueTracing.StartProcess(_transport, msg);
+            var stopwatch = Stopwatch.StartNew();
+            Exception? error = RejectBeforeDispatch(msg);
+            if (error == null)
             {
                 try
                 {
                     await DispatchAsync(msg);
+                }
+                catch (OperationCanceledException) when (Cts.IsCancellationRequested)
+                {
+                    // The drain timed out and cancelled this consumer: release, do not count an attempt.
+                    WorkQueueTracing.SetOutcome(activity, "released");
+                    await batch.ReleaseAsync(msg);
+                    draining = true;
+                    continue;
                 }
                 catch (Exception ex)
                 {
@@ -235,14 +353,17 @@ public abstract class MessageBusBase : IMessageBus
             {
                 await batch.CompleteAsync(msg);
                 WorkQueueMetrics.RecordProcessed(_transport, msg.Channel, stopwatch.Elapsed);
+                WorkQueueTracing.SetOutcome(activity, "processed");
                 continue;
             }
 
             int attempt = msg.RetryCount + 1;
             bool expired = error is MessageExpiredException;
-            bool nonRetryable = !expired && !_batchOptions.ShouldRetry(error);
+            bool tooLarge = error is MessageTooLargeException;
+            bool nonRetryable = tooLarge || (!expired && !_batchOptions.ShouldRetry(error));
             bool deadLetter = expired || nonRetryable || attempt >= _batchOptions.MaxRetries;
             var stored = StoredError.From(error, nonRetryable);
+            WorkQueueTracing.RecordException(activity, error);
 
             // A dead-lettered message reuses its scheduled time as the time its fault may be
             // redelivered, in case the fault consumer below does not run or does not finish.
@@ -253,14 +374,17 @@ public abstract class MessageBusBase : IMessageBus
 
             if (deadLetter)
             {
-                WorkQueueMetrics.RecordDeadLettered(_transport, msg.Channel, expired ? null : stopwatch.Elapsed);
+                bool consumersRan = !expired && !tooLarge;
+                WorkQueueMetrics.RecordDeadLettered(_transport, msg.Channel, consumersRan ? stopwatch.Elapsed : null);
                 if (expired) WorkQueueMetrics.RecordExpired(_transport, msg.Channel);
+                WorkQueueTracing.SetOutcome(activity, expired ? "expired" : "deadlettered");
                 faults.Add(new FaultInfo(msg.Channel, msg.Payload, msg.MessageId, attempt, DateTimeOffset.UtcNow,
                     stored, IsRedelivery: false) { FaultKey = msg.FaultKey });
             }
             else
             {
                 WorkQueueMetrics.RecordRetried(_transport, msg.Channel, stopwatch.Elapsed);
+                WorkQueueTracing.SetOutcome(activity, "retried");
             }
         }
 
@@ -270,6 +394,22 @@ public abstract class MessageBusBase : IMessageBus
             await DeliverFaultAsync(fault);
 
         return batch.Messages.Count + batch.DeadLetteredDuringClaim.Count;
+    }
+
+    // Messages that are dead-lettered without calling consumers.
+    private Exception? RejectBeforeDispatch(MessageDto msg)
+    {
+        if (msg.ExpiresAtUtc is { } expiresAt && expiresAt <= DateTime.UtcNow)
+            return new MessageExpiredException(new DateTimeOffset(expiresAt, TimeSpan.Zero));
+
+        if (_batchOptions.MaxMessageSize is { } maxSize && Encoding.UTF8.GetByteCount(msg.Payload) is var size && size > maxSize)
+        {
+            Logger.LogWarning("Message {MessageId} on channel {Channel} is {Size} bytes, over MaxMessageSize {Limit}; dead-lettering it",
+                msg.MessageId, msg.Channel, size, maxSize);
+            return new MessageTooLargeException(msg.Channel, size, maxSize);
+        }
+
+        return null;
     }
 
     private async Task DispatchAsync(MessageDto msg)
@@ -303,7 +443,7 @@ public abstract class MessageBusBase : IMessageBus
         var channels = _faults.Channels;
         if (channels.Length == 0) return 0;
 
-        var due = await ClaimDueFaultsAsync(channels, _batchOptions.MaxBatchSize, _batchOptions.FaultRedeliveryDelay, Cts.Token);
+        var due = await ClaimDueFaultsAsync(channels, _batchOptions.MaxBatchSize, _batchOptions.FaultRedeliveryDelay, _stopClaiming.Token);
         foreach (var fault in due)
             await DeliverFaultAsync(fault);
         return due.Count;
@@ -328,15 +468,50 @@ public abstract class MessageBusBase : IMessageBus
 
     // ── Disposal ────────────────────────────────────────────────────────────
 
-    /// <summary>Stops the polling loops, waiting up to ten seconds for in-flight batches.</summary>
+    // How long a drain waits, after cancelling consumers, for them to stop and release their messages.
+    private static readonly TimeSpan ReleaseGrace = TimeSpan.FromSeconds(5);
+
+    /// <inheritdoc />
+    public async Task DrainAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        if (Volatile.Read(ref _disposed) == 2) return;
+        _stopClaiming.Cancel();
+
+        var polling = Task.WhenAll(_pollingTasks);
+        try
+        {
+            await polling.WaitAsync(timeout, cancellationToken);
+            return;
+        }
+        catch (TimeoutException) { }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+
+        Logger.LogWarning("{Bus} drain did not finish within {Timeout}; cancelling in-flight consumers", GetType().Name, timeout);
+        Cts.Cancel();
+        try
+        {
+            await polling.WaitAsync(ReleaseGrace);
+        }
+        catch (TimeoutException)
+        {
+            Logger.LogWarning(
+                "{Bus} consumers did not stop after cancellation; their messages are delivered again once the claim lease expires or the claim transaction ends",
+                GetType().Name);
+        }
+    }
+
+    /// <summary>
+    /// Drains the bus (<see cref="DrainAsync"/>) for up to <see cref="BatchOptions.DrainTimeout"/>,
+    /// then releases transport resources.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0) return;
+        await DrainAsync(_batchOptions.DrainTimeout);
         Cts.Cancel();
-        try { await Task.WhenAll(_pollingTasks).WaitAsync(TimeSpan.FromSeconds(10)); }
-        catch (OperationCanceledException) { }
-        catch (TimeoutException) { }
         await DisposeCoreAsync();
+        Volatile.Write(ref _disposed, 2);
+        _stopClaiming.Dispose();
         Cts.Dispose();
         GC.SuppressFinalize(this);
     }
@@ -352,6 +527,14 @@ public abstract class MessageBusBase : IMessageBus
 /// <param name="Error">The error to record.</param>
 internal sealed record FailureOutcome(int Attempt, bool DeadLetter, DateTime? ScheduledForUtc, StoredError Error);
 
+/// <summary>A serialised message about to be inserted by a transport.</summary>
+/// <param name="Channel">The message type's channel.</param>
+/// <param name="Payload">The JSON payload.</param>
+/// <param name="MessageId">The id assigned to the message.</param>
+/// <param name="Options">Delivery time, expiry and priority (shared by every message in a batch).</param>
+/// <param name="TraceContext">The W3C trace context to store, if any (see <see cref="WorkQueueTracing"/>).</param>
+internal sealed record OutgoingMessage(string Channel, string Payload, Guid MessageId, PublishOptions Options, string? TraceContext);
+
 /// <summary>
 /// Messages claimed by one polling cycle, with the operations that record each outcome.
 /// Outcomes become durable at <see cref="CommitAsync"/> (or as they happen, for transports
@@ -366,6 +549,13 @@ internal abstract class ClaimedBatch : IAsyncDisposable
 
     public abstract Task CompleteAsync(MessageDto message);
     public abstract Task FailAsync(MessageDto message, FailureOutcome outcome);
+
+    /// <summary>
+    /// Gives a claimed message back without recording an attempt, so it can be claimed again at
+    /// once. Used when a drain stops a batch part-way. In transaction mode this is a no-op: the
+    /// message's row is left unchanged, and committing the batch releases its lock.
+    /// </summary>
+    public abstract Task ReleaseAsync(MessageDto message);
     public virtual Task CommitAsync() => Task.CompletedTask;
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
@@ -375,5 +565,6 @@ internal abstract class ClaimedBatch : IAsyncDisposable
     {
         public override Task CompleteAsync(MessageDto message) => Task.CompletedTask;
         public override Task FailAsync(MessageDto message, FailureOutcome outcome) => Task.CompletedTask;
+        public override Task ReleaseAsync(MessageDto message) => Task.CompletedTask;
     }
 }

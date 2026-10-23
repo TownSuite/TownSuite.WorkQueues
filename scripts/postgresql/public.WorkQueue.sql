@@ -12,7 +12,9 @@ CREATE TABLE IF NOT EXISTS public.workqueue (
     lasterror TEXT NULL,
     expiresat TIMESTAMP NULL,
     lockeduntil TIMESTAMP NULL,
-    locktoken UUID NULL
+    locktoken UUID NULL,
+    priority INT NOT NULL DEFAULT 0,
+    tracecontext TEXT NULL
 );
 
 -- Safe upgrade from prior schema versions
@@ -24,6 +26,8 @@ ALTER TABLE public.workqueue ADD COLUMN IF NOT EXISTS lasterror TEXT NULL;
 ALTER TABLE public.workqueue ADD COLUMN IF NOT EXISTS expiresat TIMESTAMP NULL;
 ALTER TABLE public.workqueue ADD COLUMN IF NOT EXISTS lockeduntil TIMESTAMP NULL;
 ALTER TABLE public.workqueue ADD COLUMN IF NOT EXISTS locktoken UUID NULL;
+ALTER TABLE public.workqueue ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 0;
+ALTER TABLE public.workqueue ADD COLUMN IF NOT EXISTS tracecontext TEXT NULL;
 
 -- Timestamps are UTC regardless of the session time zone.
 ALTER TABLE public.workqueue ALTER COLUMN timecreatedutc SET DEFAULT (now() AT TIME ZONE 'utc');
@@ -59,6 +63,11 @@ $$;
 
 CREATE INDEX IF NOT EXISTS ix_workqueue_channel_unprocessed
     ON public.workqueue (channel, timecreatedutc)
+    WHERE timeprocessedutc IS NULL AND failedat IS NULL;
+
+-- Matches the message bus claim order: priority, then oldest first, then insertion order.
+CREATE INDEX IF NOT EXISTS ix_workqueue_channel_priority_unprocessed
+    ON public.workqueue (channel, priority, timecreatedutc, id)
     WHERE timeprocessedutc IS NULL AND failedat IS NULL;
 
 CREATE INDEX IF NOT EXISTS ix_workqueue_channel_deadlettered

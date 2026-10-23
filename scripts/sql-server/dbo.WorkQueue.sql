@@ -17,6 +17,8 @@ CREATE TABLE [dbo].[workqueue](
 	[expiresat]        [datetime]        NULL,
 	[lockeduntil]      [datetime]        NULL,
 	[locktoken]        UNIQUEIDENTIFIER  NULL,
+	[priority]         [int]             NOT NULL CONSTRAINT [DEFAULT_WorkQueue_Priority]        DEFAULT (0),
+	[tracecontext]     [nvarchar](1000)  NULL,
 	CONSTRAINT [PK_WorkQueue] PRIMARY KEY CLUSTERED ([id] ASC)
 		WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF,
 		      ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
@@ -25,6 +27,14 @@ GO
 CREATE NONCLUSTERED INDEX [IX_WorkQueue_Channel_Unprocessed] ON [dbo].[workqueue]
 (
 	[channel]        ASC,
+	[timecreatedutc] ASC
+)
+WHERE ([timeprocessedutc] IS NULL AND [failedat] IS NULL)
+GO
+CREATE NONCLUSTERED INDEX [IX_WorkQueue_Channel_Priority_Unprocessed] ON [dbo].[workqueue]
+(
+	[channel]        ASC,
+	[priority]       ASC,
 	[timecreatedutc] ASC
 )
 WHERE ([timeprocessedutc] IS NULL AND [failedat] IS NULL)

@@ -19,6 +19,14 @@ public sealed class PublishOptions
         init => ExpiresAt = value.HasValue ? DateTimeOffset.UtcNow.Add(value.Value) : null;
     }
 
+    /// <summary>
+    /// Delivery priority within the message's channel. Lower values are delivered first; messages
+    /// of equal priority are delivered oldest first. Defaults to <c>0</c>, and may be negative.
+    /// Supported by the PostgreSQL, SQL Server and SQLite transports; the Redis transport throws
+    /// <see cref="NotSupportedException"/> for a non-zero priority.
+    /// </summary>
+    public int Priority { get; init; }
+
     internal static readonly PublishOptions None = new();
 }
 
@@ -31,4 +39,29 @@ public sealed class MessageExpiredException : Exception
     /// <summary>Creates the exception for a message that expired at <paramref name="expiresAt"/>.</summary>
     public MessageExpiredException(DateTimeOffset expiresAt)
         : base($"Message expired at {expiresAt:O} before it was delivered.") { }
+}
+
+/// <summary>
+/// Thrown by publish when a message serialises to more than <see cref="BatchOptions.MaxMessageSize"/>
+/// bytes, and recorded when such a message is found in the store and dead-lettered.
+/// </summary>
+public sealed class MessageTooLargeException : Exception
+{
+    /// <summary>Creates the exception for a message of <paramref name="size"/> bytes on <paramref name="channel"/>.</summary>
+    public MessageTooLargeException(string channel, long size, long limit)
+        : base($"Message on channel '{channel}' is {size} bytes, over the {limit}-byte limit (BatchOptions.MaxMessageSize).")
+    {
+        Channel = channel;
+        Size    = size;
+        Limit   = limit;
+    }
+
+    /// <summary>The message's channel (its type's full name).</summary>
+    public string Channel { get; }
+
+    /// <summary>The serialised UTF-8 size of the message, in bytes.</summary>
+    public long Size { get; }
+
+    /// <summary>The configured <see cref="BatchOptions.MaxMessageSize"/>.</summary>
+    public long Limit { get; }
 }

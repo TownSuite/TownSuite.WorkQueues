@@ -61,7 +61,9 @@ public class SqliteMigrationHostedService : IHostedService
                     locktoken        TEXT     NULL,
                     faultdispatchedat TEXT    NULL,
                     lasterror        TEXT     NULL,
-                    expiresat        TEXT     NULL
+                    expiresat        TEXT     NULL,
+                    priority         INTEGER  NOT NULL DEFAULT 0,
+                    tracecontext     TEXT     NULL
                 )
                 """, ct);
 
@@ -83,6 +85,15 @@ public class SqliteMigrationHostedService : IHostedService
             await AddColumnIfMissingAsync(conn, "locktoken",   "TEXT NULL", ct);
             await AddColumnIfMissingAsync(conn, "lasterror",   "TEXT NULL", ct);
             await AddColumnIfMissingAsync(conn, "expiresat",   "TEXT NULL", ct);
+            await AddColumnIfMissingAsync(conn, "priority",    "INTEGER NOT NULL DEFAULT 0", ct);
+            await AddColumnIfMissingAsync(conn, "tracecontext", "TEXT NULL", ct);
+
+            // Matches the claim order: priority, then oldest first, then insertion order.
+            await Exec(conn, """
+                CREATE INDEX IF NOT EXISTS IX_workqueue_channel_priority_unprocessed
+                ON workqueue (channel, priority, timecreatedutc, id)
+                WHERE timeprocessedutc IS NULL AND failedat IS NULL
+                """, ct);
 
             // Existing dead-letters are marked as already notified so the upgrade does not
             // send faults for them.
