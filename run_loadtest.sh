@@ -12,7 +12,8 @@ set -u # exit on using unset variable
 
 CURRENTPATH=$(pwd)
 RUNID="wqload-${BUILD_TAG:-local}-$$"
-RUNID=$(echo "$RUNID" | tr -c 'a-zA-Z0-9_.-\n' '-')
+# Docker names allow letters, digits, '_', '.' and '-' only. Bash substitution, not tr, so GNU and BSD agree.
+RUNID="${RUNID//[^a-zA-Z0-9_.-]/-}"
 NETWORK="$RUNID"
 SERVER="$RUNID-server"
 VALKEY="$RUNID-valkey"
