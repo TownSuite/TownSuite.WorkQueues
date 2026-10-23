@@ -41,6 +41,10 @@ pipeline {
                             --configuration Release \
                             --no-build \
                             --logger "nunit"
+                        dotnet test TownSuite.WorkQueues.Server.Testing/TownSuite.WorkQueues.Server.Testing.csproj \
+                            --configuration Release \
+                            --no-build \
+                            --logger "nunit"
                         '''
                     }
                     post {
@@ -76,7 +80,21 @@ pipeline {
                             --configuration Release --no-build --output build
                         dotnet pack TownSuite.WorkQueues.HealthChecks/TownSuite.WorkQueues.HealthChecks.csproj \
                             --configuration Release --no-build --output build
+                        dotnet pack TownSuite.WorkQueues.Client/TownSuite.WorkQueues.Client.csproj \
+                            --configuration Release --no-build --output build
                         '''
+                    }
+                }
+                stage('Build - Linux Docker Image') {
+                    steps {
+                        sh "${env.WORKSPACE}/buildrelease_dockerimages.sh"
+                        script {
+                            if (!env.BRANCH_NAME.startsWith('PR-')) {
+                                townsuite.archiveWithRetryAndLock('build/oci/*.tar', 3)
+                            } else {
+                                echo 'PR build detected, skipping Docker image archiving'
+                            }
+                        }
                     }
                 }
                 stage('Code Sign Detached') {

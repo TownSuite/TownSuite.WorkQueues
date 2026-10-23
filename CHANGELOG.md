@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### New features
+
+- **Graceful drain** (#11) — `IMessageBus.DrainAsync(timeout, cancellationToken)` stops claiming, lets
+  in-flight messages finish without cancelling their token, and releases the rest of the claimed batch
+  without counting an attempt. When the timeout passes, consumers' `CancellationToken` is cancelled and
+  their messages are released. `DisposeAsync` now drains for `BatchOptions.DrainTimeout` (default 30 s)
+  instead of cancelling consumers at once and waiting a fixed 10 s. All transports; on Redis a
+  released entry is re-added so it is claimable at once.
+- **Trace propagation** (#12) — spans on the `TownSuite.WorkQueues` `ActivitySource`
+  (`WorkQueueTracing.ActivitySourceName`): a producer span per publish, whose W3C context is stored
+  with the message, and a consumer span per delivery parented on it and current while consumers run.
+  Kept through retries, scheduled delivery and replay. No new package dependency. All transports.
+- **Priority** (#15) — `PublishOptions.Priority` (default `0`, lower first). PostgreSQL, SQL Server and
+  SQLite; Redis throws `NotSupportedException` for a non-zero priority.
+- **Batch publish** (#16) — `IMessageBus.PublishBatch<T>(messages, options?)` and
+  `PublishBatch<T>(messages, connection, transaction, options?)`, all or none, in input order;
+  `RedisMessageBus.PublishBatch<T>(messages, ITransaction, options?)`. All transports.
+- **Message size limit** (#17) — `BatchOptions.MaxMessageSize` (default `null`, no limit). Publish
+  throws `MessageTooLargeException`; an oversized stored message is dead-lettered unread, non-retryable.
+- **Rate limiting** (#18) — `BatchOptions.MessagesPerSecond` (default `0`, no limit), a token bucket
+  shared by the bus's polling loops. All transports.
+- **HTTPS publish/subscribe server and client** (#19) — new `TownSuite.WorkQueues.Server` (Docker image
+  `townsuite/workqueues-server`) and `TownSuite.WorkQueues.Client` (NuGet). Topics with a copy per
+  subscription, long-poll receive, ack/nack, lease redelivery and dead-lettering, idle subscription
+  expiry, JWT bearer auth with per-topic `publish:`/`subscribe:` claims, HTTPS only, size limit, and
+  trace propagation across data centres. SQL Server, PostgreSQL and Redis backends, chosen with
+  `WorkQueuesServer:Backend`.
+
+### Changes
+
+- `DisposeAsync` waits up to `DrainTimeout` (30 s) for in-flight consumers before cancelling them; it
+  used to cancel them immediately. Set `DrainTimeout` lower if shutdown must be faster.
+- Claim order is now `priority, timecreatedutc, id`. Messages published in one transaction (or one
+  batch), which share a timestamp, are now delivered in insertion order.
+- `WorkQueueMetrics.RecordPublished(transport, channel, count)` overload.
+
+### Upgrading
+
+- **Schema:** new `priority` (`INT NOT NULL DEFAULT 0`) and `tracecontext` (`TEXT` / `NVARCHAR(1000)`, nullable)
+  columns and a `(channel, priority, timecreatedutc[, id])` partial index for unprocessed rows. The migration
+  hosted services add them. **Every claim query reads both columns**, so a schema managed elsewhere
+  (for example WebPortals' WebDbMigrations) must add them before this version is deployed.
+- Transports' `Publish(message, connection, transaction, …)` overrides moved into `MessageBusBase`;
+  callers are unaffected.
+
+---
+
 ## [26.1.0] — 2026-10-05
 
 ### New features
