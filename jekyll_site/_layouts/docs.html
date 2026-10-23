@@ -15,6 +15,11 @@ layout: default
           <a href="{{ '/docs/backends/sqlite/' | relative_url }}"{% if page.url contains 'sqlite' %} class="active"{% endif %}>SQLite <span class="docs-badge">local dev</span></a>
         </div>
         <div class="docs-nav-group">
+          <p class="docs-nav-label">Features</p>
+          <a href="{{ '/docs/delivery-controls/' | relative_url }}"{% if page.url contains 'delivery-controls' %} class="active"{% endif %}>Delivery controls</a>
+          <a href="{{ '/docs/http-server/' | relative_url }}"{% if page.url contains 'http-server' %} class="active"{% endif %}>HTTPS server <span class="docs-badge">cross-DC</span></a>
+        </div>
+        <div class="docs-nav-group">
           <p class="docs-nav-label">Guides</p>
           <a href="{{ '/docs/workqueue-to-bus/' | relative_url }}"{% if page.url contains 'workqueue-to-bus' %} class="active"{% endif %}>WorkQueue → Message Bus</a>
           <a href="{{ '/docs/migrating/' | relative_url }}"{% if page.url contains 'migrating' %} class="active"{% endif %}>Migrating from v1</a>
@@ -31,3 +36,20 @@ layout: default
   </div>
 </div>
 {% include footer.html %}
+<script type="module">
+  // Render ```mermaid code blocks (kramdown emits them as language-mermaid code).
+  const blocks = document.querySelectorAll('div.language-mermaid, pre > code.language-mermaid');
+  if (blocks.length) {
+    const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.esm.min.mjs');
+    blocks.forEach(block => {
+      const host = block.tagName === 'CODE' ? block.parentElement : block;
+      const diagram = document.createElement('pre');
+      diagram.className = 'mermaid';
+      diagram.textContent = block.textContent;
+      host.replaceWith(diagram);
+    });
+    const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    mermaid.initialize({ startOnLoad: false, theme: dark ? 'dark' : 'neutral' });
+    await mermaid.run({ querySelector: 'pre.mermaid' });
+  }
+</script>

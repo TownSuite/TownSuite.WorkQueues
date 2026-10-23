@@ -98,4 +98,6 @@ Every consumer receives a `ConsumeContext<T>` with the following members:
 | `Message` | `T` | The deserialized payload. |
 | `MessageId` | `Guid` | Stable UUID assigned at publish time. Identical across all retry attempts for the same message. |
 | `SentTime` | `DateTimeOffset` | Timestamp from when `Publish()` was called. |
-| `CancellationToken` | `CancellationToken` | Cancelled when the bus is disposed. |
+| `CancellationToken` | `CancellationToken` | Cancelled when a drain runs out of time (`DrainAsync`, or `DisposeAsync` after `DrainTimeout`). Pass it to your I/O so shutdown can stop the consumer. |
+
+See [Delivery controls]({{ '/docs/delivery-controls/' | relative_url }}) for drain, tracing, priority, batch publish, size and rate limits, and [HTTPS server]({{ '/docs/http-server/' | relative_url }}) for the server's `WorkQueuesServer` settings.

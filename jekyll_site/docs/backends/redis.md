@@ -7,7 +7,7 @@ permalink: /docs/backends/redis/
 
 # Redis Backend
 
-The Redis backend uses [Redis Streams](https://redis.io/docs/data-types/streams/) with consumer groups, which provide at-least-once delivery and automatic pending-entry reclaim when a consumer goes away.
+The Redis backend uses [Redis Streams](https://redis.io/docs/data-types/streams/) with consumer groups, which provide at-least-once delivery and automatic pending-entry reclaim when a consumer goes away. It works with [Valkey](https://valkey.io/) as well as Redis (tested with Valkey 8.1); `XAUTOCLAIM` needs Redis 6.2 or Valkey 7.2 or later.
 
 <div class="callout">
 <strong>Durability note.</strong> Redis is in-memory by default. Without RDB or AOF persistence enabled, messages are lost if Redis restarts. For durable work queues, use the PostgreSQL or SQL Server backend.

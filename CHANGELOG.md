@@ -32,7 +32,10 @@ All notable changes to this project will be documented in this file.
   subscription, long-poll receive, ack/nack, lease redelivery and dead-lettering, idle subscription
   expiry, JWT bearer auth with per-topic `publish:`/`subscribe:` claims, HTTPS only, size limit, and
   trace propagation across data centres. SQL Server, PostgreSQL and Redis backends, chosen with
-  `WorkQueuesServer:Backend`.
+  `WorkQueuesServer:Backend`. Works with Valkey as well as Redis.
+- **Load test and performance gate** — `TownSuite.WorkQueues.Server.LoadTest` and `run_loadtest.sh` run the
+  server against Valkey in Docker. The Jenkins **Performance** stage fails the build when a scenario falls
+  outside `TownSuite.WorkQueues.Server.LoadTest/baseline.json`.
 
 ### Changes
 

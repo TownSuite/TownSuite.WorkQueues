@@ -106,6 +106,8 @@ The polling loop starts when the bus is constructed. Messages are delivered with
 ## Next steps
 
 - [Configuration reference]({{ '/docs/configuration/' | relative_url }}) — batch size, retries, and delays
+- [Delivery controls]({{ '/docs/delivery-controls/' | relative_url }}) — graceful drain, tracing, priority, batch publish, size and rate limits
+- [HTTPS server]({{ '/docs/http-server/' | relative_url }}) — publish and subscribe across data centres
 - [PostgreSQL backend]({{ '/docs/backends/postgres/' | relative_url }})
 - [SQL Server backend]({{ '/docs/backends/sqlserver/' | relative_url }})
 - [Redis backend]({{ '/docs/backends/redis/' | relative_url }})

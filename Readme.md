@@ -913,7 +913,7 @@ with the `WorkQueuesServer` section (environment variables `WorkQueuesServer__�
 | Setting | Default | |
 |---|---|---|
 | `Backend` | `postgres` | `sqlserver`, `postgres` or `redis` (recommended for anything beyond low volume); `memory` for development only |
-| `ConnectionString` | — | SQL Server, Postgres or Redis connection string |
+| `ConnectionString` | — | SQL Server, Postgres or Redis/Valkey connection string |
 | `Schema` | `dbo` (SQL Server), `public` (Postgres) | Schema for the tables |
 | `KeyPrefix` | `wqserver` | Prefix for the Redis keys |
 | `MaxMessageSize` | `262144` | Larger bodies get `413` |
@@ -976,6 +976,17 @@ shared id per service when the service's replicas should split the work. `Receiv
 and `NackAsync` are available for custom loops. The client continues the publisher's trace: received
 messages carry `TraceParent`, and `RunSubscriptionAsync` starts its handler span on the
 `TownSuite.WorkQueues.Client` source as a child of it.
+
+### Capacity and the load test
+
+`./run_loadtest.sh` runs the server and Valkey (the `redis` backend) in Docker, each limited to 2 CPUs and 1 GB, and drives them with `TownSuite.WorkQueues.Server.LoadTest`. Every scenario in `TownSuite.WorkQueues.Server.LoadTest/baseline.json` is checked against its thresholds: minimum published and delivered rates, maximum p99 latencies, and no missing or duplicate copies and no errors. The script exits `1` on a regression, so the Jenkins **Performance** stage fails the build, and it writes `build/loadtest/report.json`.
+
+```sh
+./run_loadtest.sh                    # every scenario
+./run_loadtest.sh --scenario fanout  # one scenario
+```
+
+On a developer laptop, the server peaked at about 11,000 HTTP requests/s on 2 CPUs, counting every publish, receive and ack, with one ack per copy. Valkey stayed around 30% CPU. That is roughly 3,200–3,700 msg/s with two subscriptions, or about 9,200 copies/s with ten, with end-to-end p99 under 85 ms and no copies lost or duplicated. Size Valkey's memory for at least one `CleanupInterval` of messages, because acknowledged entries are trimmed by the cleanup pass. Change `baseline.json` in the same pull request as the change that justifies it, and loosen it only with a reason in the commit message.
 
 > **The server is a single point of failure for cross-data-centre messages.** Do not rely on it alone
 > for correctness: keep a fallback for when it cannot be reached, such as a cache expiry. Delivery is
