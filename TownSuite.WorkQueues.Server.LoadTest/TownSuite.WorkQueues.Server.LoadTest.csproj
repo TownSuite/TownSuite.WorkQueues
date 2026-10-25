@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <IsPackable>false</IsPackable>
+        <ServerGarbageCollection>true</ServerGarbageCollection>
+        <Description>Load test for TownSuite.WorkQueues.Server, checked against baseline.json. Run with run_loadtest.sh.</Description>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\TownSuite.WorkQueues.Client\TownSuite.WorkQueues.Client.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <None Include="baseline.json" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
+</Project>

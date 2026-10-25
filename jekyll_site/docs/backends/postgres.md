@@ -28,7 +28,11 @@ builder.Services.AddSingleton(new SqlTransportOptions
 builder.Services.AddPostgresMigrationHostedService();
 ```
 
-Alternatively, run the bundled scripts manually from `scripts/postgres/` in the repository.
+Alternatively, run the bundled scripts manually from `scripts/postgresql/` in the repository.
+
+<div class="callout">
+<strong>Upgrading to the current version?</strong> The migration adds <code>priority</code> and <code>tracecontext</code> columns that every claim query reads. If you manage the schema yourself, add them first. See <a href="{{ '/docs/delivery-controls/' | relative_url }}#upgrading">Delivery controls → Upgrading</a>.
+</div>
 
 ## Register the bus
 

@@ -51,33 +51,49 @@ public class RedisMessageBus : MessageBusBase
     /// the SQL transports' transactional publish.
     /// </summary>
     /// <returns>The message id the message will have.</returns>
-    public Guid Publish<T>(T message, ITransaction transaction, PublishOptions? options = null)
+    public Guid Publish<T>(T message, ITransaction transaction, PublishOptions? options = null) =>
+        PublishBatch(new[] { message }, transaction, options)[0];
+
+    /// <summary>
+    /// Batch form of <see cref="Publish{T}(T, ITransaction, PublishOptions?)"/>: queues every message
+    /// on the caller's <paramref name="transaction"/>.
+    /// </summary>
+    /// <returns>The message ids the messages will have, in input order.</returns>
+    public IReadOnlyList<Guid> PublishBatch<T>(IEnumerable<T> messages, ITransaction transaction, PublishOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(transaction);
-        var channel = ChannelName<T>();
-        var messageId = Guid.NewGuid();
-        QueueInsert(transaction, channel, JsonSerializer.Serialize(message), messageId, options ?? new PublishOptions());
-        RecordPublished(channel);
-        return messageId;
+        // The insert only queues commands, so the publish completes synchronously.
+        return PublishCoreAsync(messages, options, batch =>
+        {
+            foreach (var message in batch) QueueInsert(transaction, message);
+            return Task.CompletedTask;
+        }).GetAwaiter().GetResult();
     }
 
-    private protected override async Task InsertAsync(string channel, string payload, Guid messageId,
-        PublishOptions options, CancellationToken cancellationToken)
+    /// <summary>Redis streams have no ordering other than arrival, so priority is not supported.</summary>
+    private protected override void ValidatePublishOptions(PublishOptions options)
+    {
+        if (options.Priority != 0)
+            throw new NotSupportedException($"{nameof(RedisMessageBus)} does not support message priority.");
+    }
+
+    private protected override async Task InsertAsync(IReadOnlyList<OutgoingMessage> messages, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var tran = Db.CreateTransaction();
-        QueueInsert(tran, channel, payload, messageId, options);
+        foreach (var message in messages) QueueInsert(tran, message);
         await tran.ExecuteAsync();
     }
 
-    private void QueueInsert(ITransaction tran, string channel, string payload, Guid messageId, PublishOptions options)
+    private void QueueInsert(ITransaction tran, OutgoingMessage message)
     {
-        var streamKey = StreamKey(channel);
+        var options = message.Options;
+        var streamKey = StreamKey(message.Channel);
         var now = DateTimeOffset.UtcNow;
-        _ = tran.SetAddAsync(ChannelsKey, channel);
+        _ = tran.SetAddAsync(ChannelsKey, message.Channel);
 
-        var envelope = new Envelope(payload, messageId.ToString(), now.ToUnixTimeMilliseconds(),
-            options.ExpiresAt?.ToUnixTimeMilliseconds(), 0);
+        var envelope = new Envelope(message.Payload, message.MessageId.ToString(), now.ToUnixTimeMilliseconds(),
+            options.ExpiresAt?.ToUnixTimeMilliseconds(), 0, message.TraceContext);
 
         if (options.DeliverAfter is { } deliverAfter && deliverAfter > now)
             _ = tran.SortedSetAddAsync(ScheduledKey(streamKey), envelope.ToJson(), deliverAfter.ToUnixTimeMilliseconds());
@@ -91,7 +107,8 @@ public class RedisMessageBus : MessageBusBase
         [property: JsonPropertyName("messageid")] string MessageId,
         [property: JsonPropertyName("sentat")] long SentAtMs,
         [property: JsonPropertyName("expiresat")] long? ExpiresAtMs,
-        [property: JsonPropertyName("attempts")] int Attempts)
+        [property: JsonPropertyName("attempts")] int Attempts,
+        [property: JsonPropertyName("tracecontext")] string? TraceContext)
     {
         public string ToJson() => JsonSerializer.Serialize(this);
 
@@ -103,6 +120,7 @@ public class RedisMessageBus : MessageBusBase
             };
             if (ExpiresAtMs.HasValue) fields.Add(new("expiresat", ExpiresAtMs.Value));
             if (Attempts > 0) fields.Add(new("attempts", Attempts));
+            if (TraceContext != null) fields.Add(new("tracecontext", TraceContext));
             return fields.ToArray();
         }
 
@@ -111,7 +129,8 @@ public class RedisMessageBus : MessageBusBase
             FieldOf(entry, "messageid") ?? string.Empty,
             LongField(entry, "sentat") ?? TimestampOf(entry.Id)?.ToUnixTimeMilliseconds() ?? 0,
             LongField(entry, "expiresat"),
-            attempts);
+            attempts,
+            FieldOf(entry, "tracecontext"));
     }
 
     // ── Claiming ────────────────────────────────────────────────────────────
@@ -127,6 +146,9 @@ public class RedisMessageBus : MessageBusBase
             end
             if m.attempts and m.attempts > 0 then
                 table.insert(fields, 'attempts'); table.insert(fields, tostring(m.attempts))
+            end
+            if m.tracecontext and m.tracecontext ~= cjson.null then
+                table.insert(fields, 'tracecontext'); table.insert(fields, m.tracecontext)
             end
             redis.call('XADD', KEYS[2], '*', unpack(fields))
             redis.call('ZREM', KEYS[1], member)
@@ -226,6 +248,7 @@ public class RedisMessageBus : MessageBusBase
             ExpiresAtUtc   = LongField(entry, "expiresat") is { } exp
                 ? DateTimeOffset.FromUnixTimeMilliseconds(exp).UtcDateTime
                 : null,
+            TraceContext   = FieldOf(entry, "tracecontext"),
             Handle         = (streamKey, entry),
             FaultKey       = FaultKeyOf(entry)
         };
@@ -275,6 +298,18 @@ public class RedisMessageBus : MessageBusBase
             // Otherwise the entry stays in the pending entry list and XAUTOCLAIM retries it
             // after ReclaimIdleTime.
         }
+
+        // A pending entry cannot be un-claimed, so it is re-added (with the attempts so far) and
+        // acknowledged, which makes it available at once. It moves to the end of the stream.
+        public override async Task ReleaseAsync(MessageDto message)
+        {
+            var (streamKey, entry) = ((string, StreamEntry))message.Handle!;
+            var tran = _db.CreateTransaction();
+            _ = tran.StreamAddAsync(streamKey, Envelope.From(entry, message.RetryCount).ToFields());
+            _ = tran.StreamAcknowledgeAsync(streamKey, _bus._options.ConsumerGroup, entry.Id);
+            _ = tran.HashDeleteAsync(_bus.RetryHashKey, entry.Id.ToString());
+            await tran.ExecuteAsync();
+        }
     }
 
     // Moves the entry to the dead-letter stream and records a pending fault, in one MULTI/EXEC.
@@ -295,6 +330,7 @@ public class RedisMessageBus : MessageBusBase
             new("lasterror", error.ToJson())
         };
         if (FieldOf(entry, "messageid") is { } id) deadFields.Add(new("messageid", id));
+        if (message.TraceContext is { } traceContext) deadFields.Add(new("tracecontext", traceContext));
 
         var record = new FaultRecord(message.Payload, message.MessageId, attempts, now.ToUnixTimeMilliseconds(), error.ToJson());
 
@@ -432,9 +468,10 @@ public class RedisMessageBus : MessageBusBase
         }
     }
 
-    // A replayed message starts again: original payload, id and send time, no attempts or expiry.
+    // A replayed message starts again: original payload, id, send time and trace, no attempts or expiry.
     private static NameValueEntry[] ReplayFields(StreamEntry entry) =>
-        entry.Values.Where(v => v.Name == "payload" || v.Name == "messageid" || v.Name == "sentat").ToArray();
+        entry.Values.Where(v => v.Name == "payload" || v.Name == "messageid" || v.Name == "sentat"
+                                || v.Name == "tracecontext").ToArray();
 
     /// <inheritdoc />
     public override async Task<IReadOnlyList<DeadLetteredMessage<T>>> GetDeadLettered<T>(int skip = 0, int take = 100,

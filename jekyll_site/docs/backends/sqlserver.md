@@ -44,6 +44,11 @@ Alternatively, apply the scripts in `scripts/sql-server/` manually:
 - `dbo.WorkQueue_Enqueue.sql` — enqueue stored procedure
 - `dbo.WorkQueue_Dequeue.sql` — dequeue stored procedure
 
+
+<div class="callout">
+<strong>Upgrading to the current version?</strong> The migration adds <code>priority</code> and <code>tracecontext</code> columns that every claim query reads. If you manage the schema yourself, add them first. See <a href="{{ '/docs/delivery-controls/' | relative_url }}#upgrading">Delivery controls → Upgrading</a>.
+</div>
+
 ## Register the bus
 
 ```csharp

@@ -41,11 +41,34 @@ pipeline {
                             --configuration Release \
                             --no-build \
                             --logger "nunit"
+                        dotnet test TownSuite.WorkQueues.Server.Testing/TownSuite.WorkQueues.Server.Testing.csproj \
+                            --configuration Release \
+                            --no-build \
+                            --logger "nunit"
                         '''
                     }
                     post {
                         always {
                             nunit testResultsPattern: '**/TestResults/*.xml'
+                        }
+                    }
+                }
+                stage('Performance') {
+                    options {
+                        timeout(time: 20, unit: 'MINUTES')
+                    }
+                    steps {
+                        // Fails the build when a scenario falls outside
+                        // TownSuite.WorkQueues.Server.LoadTest/baseline.json.
+                        sh "${env.WORKSPACE}/run_loadtest.sh"
+                    }
+                    post {
+                        always {
+                            script {
+                                if (fileExists('build/loadtest/report.json')) {
+                                    townsuite.archiveWithRetryAndLock('build/loadtest/report.json', 3)
+                                }
+                            }
                         }
                     }
                 }
@@ -76,7 +99,21 @@ pipeline {
                             --configuration Release --no-build --output build
                         dotnet pack TownSuite.WorkQueues.HealthChecks/TownSuite.WorkQueues.HealthChecks.csproj \
                             --configuration Release --no-build --output build
+                        dotnet pack TownSuite.WorkQueues.Client/TownSuite.WorkQueues.Client.csproj \
+                            --configuration Release --no-build --output build
                         '''
+                    }
+                }
+                stage('Build - Linux Docker Image') {
+                    steps {
+                        sh "${env.WORKSPACE}/buildrelease_dockerimages.sh"
+                        script {
+                            if (!env.BRANCH_NAME.startsWith('PR-')) {
+                                townsuite.archiveWithRetryAndLock('build/oci/*.tar', 3)
+                            } else {
+                                echo 'PR build detected, skipping Docker image archiving'
+                            }
+                        }
                     }
                 }
                 stage('Code Sign Detached') {

@@ -88,6 +88,30 @@
         public TimeSpan? ClaimLease { get; set; }
 
         /// <summary>
+        /// How long <see cref="IAsyncDisposable.DisposeAsync"/> waits for in-flight messages to
+        /// finish before cancelling their consumers (see <see cref="IMessageBus.DrainAsync"/>).
+        /// Defaults to 30 seconds. Keep it below the host's shutdown timeout (Kubernetes
+        /// <c>terminationGracePeriodSeconds</c>, <c>HostOptions.ShutdownTimeout</c>).
+        /// </summary>
+        public TimeSpan DrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+        /// <summary>
+        /// Largest message, in bytes of serialised UTF-8 JSON, the bus accepts. Publishing a larger
+        /// message throws <see cref="MessageTooLargeException"/> before anything is stored, and a
+        /// larger message found in the store is dead-lettered without calling consumers.
+        /// <see langword="null"/> (the default) sets no limit.
+        /// </summary>
+        public int? MaxMessageSize { get; set; }
+
+        /// <summary>
+        /// Maximum number of messages this bus delivers per second, across all of its
+        /// <see cref="MaxConcurrency"/> polling loops. Values below one are allowed (<c>0.5</c> is one
+        /// message every two seconds). <c>0</c> (the default) sets no limit. The limit is per bus
+        /// instance: with several replicas the combined rate is replicas × this value.
+        /// </summary>
+        public double MessagesPerSecond { get; set; }
+
+        /// <summary>
         /// Returns the delay to apply before the given retry attempt.
         /// </summary>
         /// <param name="attempt">The 1-based number of the failed attempt being retried.</param>

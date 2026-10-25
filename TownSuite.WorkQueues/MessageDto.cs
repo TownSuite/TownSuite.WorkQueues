@@ -36,6 +36,12 @@ namespace TownSuite.WorkQueues
         /// <summary>UTC time after which the message must not be delivered, if any.</summary>
         public DateTime? ExpiresAtUtc { get; set; }
 
+        /// <summary>Delivery priority; lower values are delivered first. See <see cref="PublishOptions.Priority"/>.</summary>
+        public int Priority { get; set; }
+
+        /// <summary>The W3C trace context stored when the message was published, if any.</summary>
+        public string? TraceContext { get; set; }
+
         // Transport-specific state for the claimed message (for example a Redis stream entry).
         internal object? Handle { get; set; }
 

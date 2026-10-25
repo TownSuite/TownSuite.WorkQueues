@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+        <PackageId>TownSuite.WorkQueues.Client</PackageId>
+        <Description>HTTPS client for TownSuite.WorkQueues.Server: publish to a topic and subscribe from any data centre, with long-polling, acknowledgement and automatic reconnect.</Description>
+        <PackageTags>workqueue;messagebus;pubsub;http;client</PackageTags>
+        <PackageReleaseNotes>Initial release. See CHANGELOG.md in the core package for full notes.</PackageReleaseNotes>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    </ItemGroup>
+
+</Project>

@@ -154,6 +154,23 @@ bus.<span class="m">Subscribe</span>&lt;<span class="t">OrderSubmitted</span>, <
           <p>Subscribe a fault consumer and it fires whenever a message is dead-lettered, carrying the original payload, exception type, stack trace, attempt count, and timestamp.</p>
         </div>
       </div>
+      <div class="why-grid" style="margin-top: 24px;">
+        <div class="why-cell">
+          <span class="why-glyph">DrainAsync(timeout)</span>
+          <h3>Graceful shutdown</h3>
+          <p>On shutdown the bus stops claiming, lets in-flight messages finish, and puts the rest back without counting an attempt. Messages still running when the timeout passes are cancelled and released. <a href="{{ '/docs/delivery-controls/' | relative_url }}#graceful-drain">More</a></p>
+        </div>
+        <div class="why-cell">
+          <span class="why-glyph">ActivitySource</span>
+          <h3>End-to-end tracing</h3>
+          <p>The publisher's trace is stored with the message and continued by the consumer, so a request and the work it queued are one trace in Tempo, Jaeger or Zipkin. <a href="{{ '/docs/delivery-controls/' | relative_url }}#tracing">More</a></p>
+        </div>
+        <div class="why-cell">
+          <span class="why-glyph">Priority · PublishBatch</span>
+          <h3>Priority, batches &amp; limits</h3>
+          <p>Urgent messages jump the backlog, bulk producers publish in one round trip, and size and rate limits protect the store and the services your consumers call. <a href="{{ '/docs/delivery-controls/' | relative_url }}">More</a></p>
+        </div>
+      </div>
       <div class="code-cols" style="margin-top: 40px;">
         <div class="code-card">
           <div class="code-card-head"><span>Program.cs</span><span class="accent">scheduled delivery</span></div>
@@ -285,14 +302,15 @@ options.RetryDelay = <span class="t">TimeSpan</span>.<span class="m">FromSeconds
             <li>Sustained throughput under ~10,000 calls per second</li>
             <li>Work that must commit atomically with your data</li>
             <li>Teams who'd rather not run a message broker</li>
+            <li>Fan-out across data centres over HTTPS at modest volume, such as cache invalidation (<a href="{{ '/docs/http-server/' | relative_url }}">HTTPS server</a>)</li>
           </ul>
         </div>
         <div class="limits-col">
           <h3>Reach for Kafka or RabbitMQ instead</h3>
           <ul class="no">
             <li>Sustained high-load or firehose event streams</li>
-            <li>Fan-out pub/sub to many independent subscribers</li>
-            <li>Push delivery — consumers here poll the table</li>
+            <li>High-volume fan-out to many independent subscribers</li>
+            <li>Push delivery — consumers here poll the table, or long-poll the HTTPS server</li>
             <li>Cross-system streaming pipelines and replay</li>
           </ul>
         </div>

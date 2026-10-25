@@ -35,13 +35,14 @@ public class PostgresMessageBus : MessageBusBase
 
     // ── Publishing ──────────────────────────────────────────────────────────
 
-    /// <inheritdoc />
+    private protected override bool SupportsTransactionalPublish => true;
+
     /// <remarks>
     /// <paramref name="connection"/> must be an <see cref="NpgsqlConnection"/> to the database the bus
     /// polls and <paramref name="transaction"/> (when supplied) an <see cref="NpgsqlTransaction"/> on it.
     /// </remarks>
-    public override async Task<Guid> Publish<T>(T message, DbConnection connection, DbTransaction? transaction,
-        PublishOptions? options = null, CancellationToken cancellationToken = default)
+    private protected override async Task InsertAsync(DbConnection connection, DbTransaction? transaction,
+        IReadOnlyList<OutgoingMessage> messages, CancellationToken cancellationToken)
     {
         if (connection is not NpgsqlConnection npgsqlConnection)
             throw new ArgumentException("connection must be an NpgsqlConnection", nameof(connection));
@@ -51,34 +52,35 @@ public class PostgresMessageBus : MessageBusBase
         if (npgsqlConnection.State == ConnectionState.Closed)
             await npgsqlConnection.OpenAsync(cancellationToken);
 
-        var channel = ChannelName<T>();
-        var messageId = Guid.NewGuid();
-        await InsertAsync(npgsqlConnection, transaction as NpgsqlTransaction, channel, JsonSerializer.Serialize(message),
-            messageId, options ?? new PublishOptions(), cancellationToken);
-        RecordPublished(channel);
-        return messageId;
+        await InsertAsync(npgsqlConnection, transaction as NpgsqlTransaction, messages, cancellationToken);
     }
 
-    private protected override async Task InsertAsync(string channel, string payload, Guid messageId,
-        PublishOptions options, CancellationToken cancellationToken)
+    private protected override async Task InsertAsync(IReadOnlyList<OutgoingMessage> messages, CancellationToken cancellationToken)
     {
         await using var conn = new NpgsqlConnection(_options.ConnectionString);
         await conn.OpenAsync(cancellationToken);
-        await InsertAsync(conn, null, channel, payload, messageId, options, cancellationToken);
+        await InsertAsync(conn, null, messages, cancellationToken);
     }
 
-    private async Task InsertAsync(NpgsqlConnection conn, NpgsqlTransaction? tran, string channel, string payload,
-        Guid messageId, PublishOptions options, CancellationToken cancellationToken)
+    // One statement for the whole batch, so it is atomic without a transaction. Rows are inserted
+    // in input order, so their ids (the tie-break for equal timestamps) keep that order.
+    private async Task InsertAsync(NpgsqlConnection conn, NpgsqlTransaction? tran, IReadOnlyList<OutgoingMessage> messages,
+        CancellationToken cancellationToken)
     {
+        var first = messages[0];
         await using var cmd = new NpgsqlCommand($"""
-            INSERT INTO {Table} (channel, payload, messageid, timecreatedutc, scheduledfor, expiresat)
-            VALUES (@channel, @payload, @messageid, {UtcNow}, @scheduledfor, @expiresat)
+            INSERT INTO {Table} (channel, payload, messageid, timecreatedutc, scheduledfor, expiresat, priority, tracecontext)
+            SELECT @channel, m.payload, m.messageid, {UtcNow}, @scheduledfor, @expiresat, @priority, @tracecontext
+            FROM unnest(@payloads, @messageids) WITH ORDINALITY AS m(payload, messageid, ord)
+            ORDER BY m.ord
             """, conn, tran);
-        cmd.Parameters.AddWithValue("@channel", channel);
-        cmd.Parameters.AddWithValue("@payload", payload);
-        cmd.Parameters.AddWithValue("@messageid", messageId);
-        cmd.Parameters.Add(TimestampParam("@scheduledfor", options.DeliverAfter?.UtcDateTime));
-        cmd.Parameters.Add(TimestampParam("@expiresat", options.ExpiresAt?.UtcDateTime));
+        cmd.Parameters.AddWithValue("@channel", first.Channel);
+        cmd.Parameters.AddWithValue("@payloads", messages.Select(m => m.Payload).ToArray());
+        cmd.Parameters.AddWithValue("@messageids", messages.Select(m => m.MessageId).ToArray());
+        cmd.Parameters.Add(TimestampParam("@scheduledfor", first.Options.DeliverAfter?.UtcDateTime));
+        cmd.Parameters.Add(TimestampParam("@expiresat", first.Options.ExpiresAt?.UtcDateTime));
+        cmd.Parameters.AddWithValue("@priority", first.Options.Priority);
+        cmd.Parameters.Add(new NpgsqlParameter("@tracecontext", NpgsqlDbType.Text) { Value = (object?)first.TraceContext ?? DBNull.Value });
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -101,11 +103,11 @@ public class PostgresMessageBus : MessageBusBase
               AND (scheduledfor IS NULL OR scheduledfor <= {UtcNow})
               AND (lockeduntil IS NULL OR lockeduntil < {UtcNow})
               AND channel = ANY(@channels)
-            ORDER BY timecreatedutc
+            ORDER BY priority, timecreatedutc, id
             FOR UPDATE SKIP LOCKED
             LIMIT @maxMessages
             """;
-        const string columns = "id, channel, payload, retrycount, messageid, timecreatedutc, expiresat";
+        const string columns = "id, channel, payload, retrycount, messageid, timecreatedutc, expiresat, priority, tracecontext";
 
         var conn = new NpgsqlConnection(_options.ConnectionString);
         try
@@ -163,10 +165,13 @@ public class PostgresMessageBus : MessageBusBase
                 RetryCount     = reader.GetInt32(3),
                 MessageId      = reader.GetGuid(4),
                 TimeCreatedUtc = reader.GetDateTime(5),
-                ExpiresAtUtc   = reader.IsDBNull(6) ? null : reader.GetDateTime(6)
+                ExpiresAtUtc   = reader.IsDBNull(6) ? null : reader.GetDateTime(6),
+                Priority       = reader.GetInt32(7),
+                TraceContext   = reader.IsDBNull(8) ? null : reader.GetString(8)
             });
         }
-        return messages.OrderBy(m => m.TimeCreatedUtc).ThenBy(m => m.Id).ToList();
+        // RETURNING does not preserve the subquery's order.
+        return messages.OrderBy(m => m.Priority).ThenBy(m => m.TimeCreatedUtc).ThenBy(m => m.Id).ToList();
     }
 
     private sealed class Batch : ClaimedBatch
@@ -215,6 +220,19 @@ public class PostgresMessageBus : MessageBusBase
             cmd.Parameters.AddWithValue("@deadLetter", outcome.DeadLetter);
             cmd.Parameters.Add(TimestampParam("@scheduledFor", outcome.ScheduledForUtc));
             cmd.Parameters.AddWithValue("@lastError", outcome.Error.ToJson());
+            await ExecuteAsync(cmd, message);
+        }
+
+        public override async Task ReleaseAsync(MessageDto message)
+        {
+            // In transaction mode the row is untouched and the commit releases its lock.
+            if (!_leaseToken.HasValue) return;
+
+            await using var cmd = new NpgsqlCommand($"""
+                UPDATE {_bus.Table}
+                SET lockeduntil = NULL, locktoken = NULL
+                WHERE id = @id{LeaseGuard}
+                """, _conn, _tran);
             await ExecuteAsync(cmd, message);
         }
 

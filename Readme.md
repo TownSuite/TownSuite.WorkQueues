@@ -109,10 +109,17 @@ cycle (within `MaxWaitTime`, default 5 s).
   - [Checking bus health with IsPolling](#checking-bus-health-with-ispolling)
 - [Message Expiry](#message-expiry)
 - [Transactional Publish (outbox)](#transactional-publish-outbox)
+- [Batch Publish](#batch-publish)
+- [Priority](#priority)
+- [Message Size Limit](#message-size-limit)
 - [Concurrency](#concurrency)
   - [Lease-based claiming](#lease-based-claiming)
+  - [Rate limiting](#rate-limiting)
+- [Graceful Shutdown (drain)](#graceful-shutdown-drain)
+- [Cross-Data-Centre Messaging (HTTPS server)](#cross-data-centre-messaging-https-server)
 - [Purging Old Messages](#purging-old-messages)
 - [Monitoring: Metrics & Queue Statistics](#monitoring-metrics--queue-statistics)
+  - [Tracing](#tracing)
   - [Health checks](#health-checks)
 - [Configuration Reference](#configuration-reference)
 - [Running the Tests](#running-the-tests)
@@ -728,6 +735,60 @@ procedure and returns the message id.
 
 ---
 
+## Batch Publish
+
+`PublishBatch` publishes many messages of one type together, all or none, and returns their ids in
+input order. They share one `PublishOptions` and are delivered in the order given (within a priority):
+
+```csharp
+IReadOnlyList<Guid> ids = await bus.PublishBatch(invoices.Select(i => new InvoiceDue { InvoiceId = i.Id }));
+
+// On the caller's transaction (outbox), like the single-message overload:
+await bus.PublishBatch(messages, cn, tx, new PublishOptions { TimeToLive = TimeSpan.FromHours(1) });
+```
+
+| Transport | How a batch is written |
+|---|---|
+| PostgreSQL | One `INSERT … SELECT FROM unnest(…)` statement |
+| SQL Server | One `INSERT` per 1,000 messages, in a transaction when there is more than one |
+| SQLite | One prepared `INSERT` per message, in a transaction |
+| Redis | `XADD`s in one `MULTI`/`EXEC`; `RedisMessageBus.PublishBatch(messages, ITransaction)` queues them on yours |
+
+An empty sequence publishes nothing and makes no round trip.
+
+---
+
+## Priority
+
+`PublishOptions.Priority` orders delivery within a message type: lower values are delivered first,
+and messages of equal priority oldest first. The default is `0`, and negative values are allowed:
+
+```csharp
+await bus.Publish(new ReceiptRequested { PaymentId = id }, new PublishOptions { Priority = -10 });
+```
+
+Priority is supported on PostgreSQL, SQL Server and SQLite. A Redis stream has no order but arrival, so
+`RedisMessageBus` throws `NotSupportedException` for a non-zero priority. A message keeps its priority
+through retries and replay. With `MaxConcurrency` above `1`, messages are claimed in priority order but
+can finish in any order.
+
+---
+
+## Message Size Limit
+
+`BatchOptions.MaxMessageSize` (bytes of serialised UTF-8 JSON, default `null`: no limit) rejects a
+message that is too large when it is published, with `MessageTooLargeException` (it has `Size`, `Limit`
+and `Channel`), before anything is stored. A batch containing one is rejected as a whole. A message
+over the limit that is already in the store (published before the limit was set, or by a bus with a
+higher one) is dead-lettered on its first claim without calling consumers. Its `Fault<T>` has the
+`MessageTooLargeException` type and `NonRetryable = true`.
+
+```csharp
+options.MaxMessageSize = 256 * 1024;
+```
+
+---
+
 ## Concurrency
 
 Each bus processes its claimed batch one message at a time. Set `MaxConcurrency` to run several polling
@@ -753,6 +814,15 @@ Your consumer's own database work runs on its own connection, separate from the 
 dies between your commit and the claim's, the message is redelivered, so consumers must be idempotent
 (check `MessageId` or your own state first).
 
+### Rate limiting
+
+`BatchOptions.MessagesPerSecond` (default `0`: no limit) caps how many messages a bus delivers per
+second, across all of its `MaxConcurrency` loops. Use it for consumers that call a rate-limited service,
+so they don't burn retries into dead-letters on its rejections. Values below one are allowed (`0.5` is
+one message every two seconds). Tokens for a whole claim are taken before claiming, so claimed messages
+never wait for one and leases do not run down. The limit is per bus: three replicas at `5` deliver up
+to 15 a second.
+
 ### Lease-based claiming
 
 Set `ClaimLease` to hold claimed messages with a lease (`lockeduntil` / `locktoken` columns) instead of
@@ -772,6 +842,155 @@ The trade-off is recovery time: if a process dies, its claimed messages become a
 the lease expires, not immediately. A consumer that outlives its lease sees the message delivered a
 second time, and its own late outcome is ignored (a warning is logged). SQLite always claims this way,
 using `ClaimLease` when set and `LockTimeout` otherwise. Lease and transaction claimers can share a table.
+
+---
+
+## Graceful Shutdown (drain)
+
+`DrainAsync(timeout, cancellationToken)` stops the bus claiming new work and waits for the messages
+already being consumed to finish. Messages in the claimed batch that have not started go straight back
+to the queue. If `timeout` passes, or `cancellationToken` is cancelled, first, the consumers'
+`ConsumeContext<T>.CancellationToken` is cancelled and their messages are released. Released messages
+are not counted as attempts.
+
+`DisposeAsync` drains for `BatchOptions.DrainTimeout` (default 30 s). To use the host's shutdown token
+instead, drain in `IHostedService.StopAsync`:
+
+```csharp
+public async Task StopAsync(CancellationToken cancellationToken)
+{
+    await bus.DrainAsync(TimeSpan.FromSeconds(25), cancellationToken);
+    await bus.DisposeAsync();
+}
+```
+
+| Transport | What releasing a message does |
+|---|---|
+| PostgreSQL / SQL Server, transaction mode | Nothing to undo: the row is left unchanged and the claim transaction commits |
+| PostgreSQL / SQL Server with `ClaimLease`, SQLite | Clears the lease, so the message can be claimed again at once |
+| Redis | Re-adds the entry with its attempt count and acknowledges the old one, so it can be claimed again at once (it moves to the end of the stream) |
+
+A consumer that ignores its cancellation token keeps its message until the claim lease expires or the
+claim transaction ends (when the process exits), and then the message is delivered again. See
+[WORKER_SERVICES.md](WORKER_SERVICES.md#concepts-and-lifecycle) for timeouts under Kubernetes.
+
+---
+
+## Cross-Data-Centre Messaging (HTTPS server)
+
+A bus only reaches processes that can connect to its database or Redis, and subscribers that share a
+channel split its messages between them. `TownSuite.WorkQueues.Server` is an HTTPS API, hosted in one
+data centre, that any service can publish to or subscribe from over the VPN or the internet. Every
+subscription on a topic gets **its own copy** of each message (fan-out), so it also suits messages
+meant for every instance, such as cache invalidation. Subscribers make only outgoing HTTPS requests, so
+no inbound firewall rules are needed where they run.
+
+| Endpoint | Claim | What it does |
+|---|---|---|
+| `POST /api/v1/topics/{topic}/messages` | `publish:{topic}` | Publishes the JSON body: one copy per active subscription. `202 { messageId, subscriptions }` |
+| `PUT /api/v1/topics/{topic}/subscriptions/{subscriberId}` | `subscribe:{topic}` | Registers or renews a subscription. It receives messages published from then on |
+| `GET …/subscriptions/{subscriberId}` | `subscribe:{topic}` | `{ expiresAt, pending, deadLettered }` |
+| `GET …/subscriptions/{subscriberId}/messages?wait=30&max=10` | `subscribe:{topic}` | Long-polls; returns as soon as there are messages. `404` once the subscription has expired |
+| `POST …/messages/{receipt}/ack` | `subscribe:{topic}` | Acknowledges a delivery. `410` if its lease was lost and it may be redelivered |
+| `POST …/messages/{receipt}/nack` | `subscribe:{topic}` | Retries after `RetryDelay` (body `{ "error": "…" }` is optional) |
+| `DELETE …/subscriptions/{subscriberId}` | `subscribe:{topic}` | Removes the subscription and its waiting messages |
+| `GET /healthz` | none | Backend reachability, for probes (plain HTTP allowed) |
+
+Delivery follows the bus rules. A received message is held for `ClaimLease` (30 s) and is delivered
+again if it is not acknowledged; after `MaxRetries` (5) unacknowledged deliveries it is dead-lettered. A
+subscription that is neither renewed nor polled for `SubscriptionIdleTimeout` (5 min) expires, stops
+receiving copies, and its waiting messages are removed, so short-lived subscribers such as pods do not
+pile up. Processes that share a `subscriberId` share that subscription's copies, which is how the
+replicas of one service divide the work.
+
+### Hosting
+
+The server is the `townsuite/workqueues-server` image (built by Jenkins from
+`TownSuite.WorkQueues.Server/Dockerfile`). It listens on port 8080 and expects TLS to end at the ingress.
+`X-Forwarded-Proto` is honoured, and requests that did not arrive over HTTPS are rejected. Configure it
+with the `WorkQueuesServer` section (environment variables `WorkQueuesServer__…`):
+
+| Setting | Default | |
+|---|---|---|
+| `Backend` | `postgres` | `sqlserver`, `postgres` or `redis` (recommended for anything beyond low volume); `memory` for development only |
+| `ConnectionString` | — | SQL Server, Postgres or Redis/Valkey connection string |
+| `Schema` | `dbo` (SQL Server), `public` (Postgres) | Schema for the tables |
+| `KeyPrefix` | `wqserver` | Prefix for the Redis keys |
+| `MaxMessageSize` | `262144` | Larger bodies get `413` |
+| `SubscriptionIdleTimeout`, `ClaimLease`, `MaxRetries`, `RetryDelay`, `RetryBackoffMultiplier`, `MaxRetryDelay` | 5 min, 30 s, 5, 5 s, 2, 5 min | Expiry, redelivery and dead-lettering |
+| `RetainAcknowledged`, `RetainDeadLettered` | 1 day, 7 days | How long finished copies are kept |
+| `RequireHttps`, `TrustForwardedHeaders` | `true`, `true` | |
+| `Jwt:Authority` *or* `Jwt:SigningKey` + `Jwt:Issuer` | — | OpenID Connect authority, or an HMAC key (32+ bytes) |
+| `Jwt:Audience` | — | Required `aud` |
+| `Jwt:TopicClaimType` | `scope` | Claim that lists topic permissions |
+
+Switching backend is a configuration change only, for example in `appsettings.json`:
+
+```json
+"WorkQueuesServer": { "Backend": "sqlserver", "ConnectionString": "Server=…;Database=WorkQueues;…" }
+```
+
+On SQL Server and Postgres the server creates the `topicsubscription` and `topicdelivery` tables on
+startup (`MigrateOnStartup`), and publishing writes one row per active subscription. On Redis each topic
+is a stream with one consumer group per subscription, so a message is written once. The SQL backends
+suit low-volume traffic, such as cache invalidation and release or configuration-change events. Use
+Redis for heavier traffic, and load-test the HTTP layer against it first. Changing backend does not move
+existing subscriptions or messages.
+
+### Tokens
+
+Every endpoint but `/healthz` needs a bearer token whose signature, issuer, audience and lifetime are
+valid (otherwise `401`). The token's `scope` claim (or `Jwt:TopicClaimType`) must grant the topic
+(otherwise `403`). Values are space-separated, or the claim can be repeated:
+
+```
+scope: "publish:fees-changed subscribe:cache-invalidation"
+scope: "publish:*"          # any topic
+```
+
+Give each service a token for only the topics it needs.
+
+### Client
+
+`TownSuite.WorkQueues.Client` (NuGet) wraps the API:
+
+```csharp
+builder.Services.AddHttpClient("workqueues", c => c.BaseAddress = new Uri("https://workqueues.example.townsuite.com/"));
+builder.Services.AddSingleton(sp => new WorkQueuesClient(
+    sp.GetRequiredService<IHttpClientFactory>().CreateClient("workqueues"),
+    new WorkQueuesClientOptions { AccessTokenProvider = ct => tokenCache.GetTokenAsync(ct) },
+    sp.GetRequiredService<ILogger<WorkQueuesClient>>()));
+
+// Publish
+await client.PublishAsync("cache-invalidation", new CacheInvalidated { Key = "fees" });
+
+// Subscribe: registers, long-polls, acks on success, nacks on exception, reconnects with backoff
+// and re-registers an expired subscription. Run it from a BackgroundService.
+await client.RunSubscriptionAsync<CacheInvalidated>("cache-invalidation", $"web-{Environment.MachineName}",
+    (message, ct) => { cache.Remove(message.Message.Key); return Task.CompletedTask; },
+    cancellationToken: stoppingToken);
+```
+
+Use a per-instance `subscriberId` (as above) when every instance must see every message, and one
+shared id per service when the service's replicas should split the work. `ReceiveAsync`, `AckAsync`
+and `NackAsync` are available for custom loops. The client continues the publisher's trace: received
+messages carry `TraceParent`, and `RunSubscriptionAsync` starts its handler span on the
+`TownSuite.WorkQueues.Client` source as a child of it.
+
+### Capacity and the load test
+
+`./run_loadtest.sh` runs the server and Valkey (the `redis` backend) in Docker, each limited to 2 CPUs and 1 GB, and drives them with `TownSuite.WorkQueues.Server.LoadTest`. Every scenario in `TownSuite.WorkQueues.Server.LoadTest/baseline.json` is checked against its thresholds: minimum published and delivered rates, maximum p99 latencies, and no missing or duplicate copies and no errors. The script exits `1` on a regression, so the Jenkins **Performance** stage fails the build, and it writes `build/loadtest/report.json`.
+
+```sh
+./run_loadtest.sh                    # every scenario
+./run_loadtest.sh --scenario fanout  # one scenario
+```
+
+On a developer laptop, the server peaked at about 11,000 HTTP requests/s on 2 CPUs, counting every publish, receive and ack, with one ack per copy. Valkey stayed around 30% CPU. That is roughly 3,200–3,700 msg/s with two subscriptions, or about 9,200 copies/s with ten, with end-to-end p99 under 85 ms and no copies lost or duplicated. Size Valkey's memory for at least one `CleanupInterval` of messages, because acknowledged entries are trimmed by the cleanup pass. Change `baseline.json` in the same pull request as the change that justifies it, and loosen it only with a reason in the commit message.
+
+> **The server is a single point of failure for cross-data-centre messages.** Do not rely on it alone
+> for correctness: keep a fallback for when it cannot be reached, such as a cache expiry. Delivery is
+> at least once, so make handlers idempotent (`MessageId` is the same on every copy and redelivery).
 
 ---
 
@@ -838,6 +1057,28 @@ metric collection never queries the store:
 await using var tracking = WorkQueueMetrics.TrackQueue<CartAddItemRequested>(bus, TimeSpan.FromSeconds(30));
 ```
 
+### Tracing
+
+Every transport emits spans on the `ActivitySource` `TownSuite.WorkQueues` (`WorkQueueTracing.ActivitySourceName`).
+Publishing starts a producer span and stores its W3C trace context with the message (the `tracecontext`
+column, or stream field on Redis). Each delivery starts a consumer span whose parent is that context,
+and it is `Activity.Current` while consumers run. So a request and the work it queued appear as one
+trace, with no changes to consumer code. The context is kept through retries, scheduled delivery and
+replay.
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(t => t.AddSource(WorkQueueTracing.ActivitySourceName).AddOtlpExporter());
+```
+
+Spans are named `publish {channel}` and `process {channel}`, and tagged with `messaging.system`,
+`messaging.destination.name`, `messaging.message.id`, `messaging.operation.type`,
+`townsuite.workqueues.delivery_attempt` and `townsuite.workqueues.outcome` (`processed`, `retried`,
+`deadlettered`, `expired` or `released`). A failed delivery has error status and an `exception` event.
+When nothing listens to the source no span is created, but the publisher's `Activity.Current` is still
+stored, so traces join up once the consuming side adds the source. Messages published before the
+upgrade start a new trace.
+
 ### Health checks
 
 `TownSuite.WorkQueues.HealthChecks` adds a health check that is `Unhealthy` when the bus's polling has
@@ -872,6 +1113,9 @@ and register one check per bus with distinct names.
 | `IsRetryable` | `null` (retry all) | Return `false` to dead-letter an exception immediately |
 | `ClaimLease` | `null` (transaction) | PostgreSQL / SQL Server: hold claims with a lease of this length instead of an open transaction |
 | `FaultRedeliveryDelay` | `1 min` | Delay before an undelivered `Fault<T>` is delivered again; also the lease a bus holds while redelivering |
+| `DrainTimeout` | `30s` | How long `DisposeAsync` lets in-flight messages finish before cancelling their consumers |
+| `MaxMessageSize` | `null` (no limit) | Largest serialised message, in bytes; larger ones are rejected at publish and dead-lettered if found in the store |
+| `MessagesPerSecond` | `0` (no limit) | Maximum deliveries per second for this bus, across its polling loops |
 
 ### `SqlTransportOptions` (extends `BatchOptions`)
 
@@ -934,6 +1178,8 @@ The following DDL changes are applied automatically by `PostgresMigrationHostedS
 | `retrycount` column added | `INT NOT NULL DEFAULT 0` |
 | `failedat` column added | `TIMESTAMP NULL` |
 | Partial index added | On `(channel, timecreatedutc)` where unprocessed and not failed |
+| `priority` column added | `INT NOT NULL DEFAULT 0` (SQLite `INTEGER`), with a partial index on `(channel, priority, timecreatedutc, id)` |
+| `tracecontext` column added | `TEXT NULL` (SQL Server `NVARCHAR(1000) NULL`) |
 
 The migration statements are idempotent (`IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, `DO` block guards) and safe to run on an existing table with live data.
 

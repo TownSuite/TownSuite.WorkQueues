@@ -483,3 +483,7 @@ FodyWeavers.xsd
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudio,rider
 /.idea/.idea.TownSuite.WorkQueues/.idea/copilot.data.migration.*.xml
+
+# Load test reports and OCI images written by run_loadtest.sh and buildrelease_dockerimages.sh
+build/loadtest/
+build/oci/

@@ -13,7 +13,8 @@ namespace TownSuite.WorkQueues;
 /// the same message in a single dispatch. If any consumer throws, the entire message is retried —
 /// including consumers that succeeded in the previous attempt. Design consumers to be idempotent.</para>
 /// <para><strong>Lifecycle:</strong> dispose the bus (via <see cref="IAsyncDisposable.DisposeAsync"/>)
-/// to stop the polling loop gracefully before application shutdown.</para>
+/// to stop the polling loop gracefully before application shutdown. Disposing drains the bus:
+/// in-flight messages are given time to finish (see <see cref="DrainAsync"/>).</para>
 /// </remarks>
 public interface IMessageBus : IAsyncDisposable
 {
@@ -56,6 +57,56 @@ public interface IMessageBus : IAsyncDisposable
     /// <returns>The <see cref="ConsumeContext{T}.MessageId"/> assigned to the message.</returns>
     Task<Guid> Publish<T>(T message, PublishOptions options, CancellationToken cancellationToken = default)
         => throw new NotSupportedException($"{GetType().Name} does not support publish options.");
+
+    /// <summary>
+    /// Serialises <paramref name="messages"/> and inserts them together, in one round trip where the
+    /// store allows it. Either every message is published or none is. The messages share
+    /// <paramref name="options"/> and are delivered in the order given (within a priority).
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="messages">The messages to publish. An empty sequence publishes nothing.</param>
+    /// <param name="options">Delivery time, expiry and priority for every message.</param>
+    /// <param name="cancellationToken">Token to cancel the publish operation.</param>
+    /// <returns>The <see cref="ConsumeContext{T}.MessageId"/> of each message, in input order.</returns>
+    Task<IReadOnlyList<Guid>> PublishBatch<T>(IEnumerable<T> messages, PublishOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support batch publish.");
+
+    /// <summary>
+    /// Batch form of the transactional <c>Publish</c>: inserts <paramref name="messages"/> using the
+    /// caller's <paramref name="connection"/> and <paramref name="transaction"/>, so they are
+    /// published only if the caller's transaction commits.
+    /// </summary>
+    /// <typeparam name="T">The message type.</typeparam>
+    /// <param name="messages">The messages to publish.</param>
+    /// <param name="connection">An open connection to the bus's database.</param>
+    /// <param name="transaction">The caller's transaction, or <see langword="null"/> to publish all or none on its own.</param>
+    /// <param name="options">Delivery time, expiry and priority for every message.</param>
+    /// <param name="cancellationToken">Token to cancel the publish operation.</param>
+    /// <returns>The <see cref="ConsumeContext{T}.MessageId"/> of each message, in input order.</returns>
+    Task<IReadOnlyList<Guid>> PublishBatch<T>(IEnumerable<T> messages, System.Data.Common.DbConnection connection,
+        System.Data.Common.DbTransaction? transaction, PublishOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support transactional publish.");
+
+    /// <summary>
+    /// Stops the bus taking new work and waits for messages already being consumed to finish.
+    /// Claimed messages that have not started are released straight back to the queue. If
+    /// <paramref name="timeout"/> passes (or <paramref name="cancellationToken"/> is cancelled)
+    /// first, consumers' <see cref="ConsumeContext{T}.CancellationToken"/> is cancelled and the
+    /// messages they were handling are released without counting an attempt.
+    /// </summary>
+    /// <remarks>
+    /// The bus does not resume afterwards; dispose it. <see cref="IAsyncDisposable.DisposeAsync"/>
+    /// drains for <c>BatchOptions.DrainTimeout</c> itself, so call this directly only to choose a
+    /// different timeout, for example from <c>IHostedService.StopAsync</c>. A consumer that ignores
+    /// its cancellation token keeps its message until the claim lease expires or the claim
+    /// transaction ends.
+    /// </remarks>
+    /// <param name="timeout">How long in-flight consumers may run before they are cancelled.</param>
+    /// <param name="cancellationToken">Cancelling it ends the wait early, as if the timeout had passed.</param>
+    Task DrainAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+        => throw new NotSupportedException($"{GetType().Name} does not support draining.");
 
     /// <summary>
     /// Registers <paramref name="consumer"/> to receive messages of type <typeparamref name="T"/>.

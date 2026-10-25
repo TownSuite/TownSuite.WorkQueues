@@ -7,7 +7,7 @@ permalink: /docs/backends/redis/
 
 # Redis Backend
 
-The Redis backend uses [Redis Streams](https://redis.io/docs/data-types/streams/) with consumer groups, which provide at-least-once delivery and automatic pending-entry reclaim when a consumer goes away.
+The Redis backend uses [Redis Streams](https://redis.io/docs/data-types/streams/) with consumer groups, which provide at-least-once delivery and automatic pending-entry reclaim when a consumer goes away. It works with [Valkey](https://valkey.io/) as well as Redis (tested with Valkey 8.1); `XAUTOCLAIM` needs Redis 6.2 or Valkey 7.2 or later.
 
 <div class="callout">
 <strong>Durability note.</strong> Redis is in-memory by default. Without RDB or AOF persistence enabled, messages are lost if Redis restarts. For durable work queues, use the PostgreSQL or SQL Server backend.
@@ -64,3 +64,5 @@ The bus uses `XREADGROUP` to read pending entries from a Redis Stream. Each cons
 When a consumer goes offline without acknowledging its messages, those entries become idle. The bus periodically calls `XAUTOCLAIM` to transfer entries idle longer than `ReclaimIdleTime` to the current consumer for redelivery.
 
 Messages are acknowledged with `XACK` after successful processing. A failed message increments its retry count and is requeued; after `MaxRetries` attempts it is dead-lettered (moved to a `{KeyPrefix}:deadletter` stream).
+
+A stream has no ordering other than arrival, so `PublishOptions.Priority` is not supported: a non-zero priority throws `NotSupportedException`. When a drain releases a claimed entry, the entry is re-added with its attempt count and the old one acknowledged, so it can be claimed again at once, at the end of the stream. The trace context is stored in a `tracecontext` stream field.
