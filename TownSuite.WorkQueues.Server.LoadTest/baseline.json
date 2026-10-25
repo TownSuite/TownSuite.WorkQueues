@@ -1,5 +1,5 @@
 {
-  "description": "Performance floor for TownSuite.WorkQueues.Server on the redis backend (Valkey 8.1). run_loadtest.sh runs every scenario with the server and Valkey limited to 2 CPUs and 1 GB each; a result outside these thresholds fails the build. Set on 2026-10-23 at about 50% of the throughput and 4x the p99 latency measured on a developer laptop. Tighten from the reports Jenkins archives (build/loadtest/report.json); loosen only with a reason in the commit message.",
+  "description": "Performance floor for TownSuite.WorkQueues.Server on the redis backend (Valkey 8.1). run_loadtest.sh runs every scenario with the server and Valkey limited to 2 CPUs and 1 GB each; a result outside these thresholds fails the build. Throughput floors recalibrated on 2026-10-25 to about 70% of the first Jenkins run (PR-20 build #5: steady 1523 published/s and 3020 delivered/s, fanout 517 and 5129); p99 caps are 3x or more what Jenkins measured. Tighten from the reports Jenkins archives (build/loadtest/report.json); loosen only with a reason in the commit message.",
   "scenarios": [
     {
       "name": "steady",
@@ -10,8 +10,8 @@
       "payloadBytes": 512,
       "maxPerReceive": 100,
       "thresholds": {
-        "minPublishedPerSecond": 1800,
-        "minDeliveredPerSecond": 3600,
+        "minPublishedPerSecond": 1050,
+        "minDeliveredPerSecond": 2100,
         "maxPublishP99Ms": 100,
         "maxEndToEndP99Ms": 300,
         "maxMissing": 0,
@@ -28,8 +28,8 @@
       "payloadBytes": 512,
       "maxPerReceive": 100,
       "thresholds": {
-        "minPublishedPerSecond": 450,
-        "minDeliveredPerSecond": 4500,
+        "minPublishedPerSecond": 360,
+        "minDeliveredPerSecond": 3600,
         "maxPublishP99Ms": 100,
         "maxEndToEndP99Ms": 300,
         "maxMissing": 0,

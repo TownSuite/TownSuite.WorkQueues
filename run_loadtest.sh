@@ -31,6 +31,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# CPU is the limit being measured: the containers below ask for 2 + 2 + 4 CPUs.
+echo "Agent: $(nproc 2>/dev/null || sysctl -n hw.ncpu) CPUs; Docker: $(docker info --format '{{.NCPU}} CPUs, {{.MemTotal}} bytes')"
 echo "Building the server image and the load test"
 docker build -q -f TownSuite.WorkQueues.Server/Dockerfile -t "$IMAGE" . >/dev/null
 rm -rf "$REPORT_DIR/app" "$REPORT_DIR/report.json"
