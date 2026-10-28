@@ -9,6 +9,10 @@ pipeline {
         timestamps()
         timeout(time: 2, unit: 'HOURS')
     }
+    environment {
+        AUTOCONFIGURE_NUGET = 'true'
+        AUTOCONFIGURE_DOCKER = 'true'
+    }
     stages {
         stage('Start Automation Script') {
             agent { label 'starting-agent' }
